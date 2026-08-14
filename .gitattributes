@@ -1,0 +1,6 @@
+# コンテナ内で実行されるファイルは必ず LF。
+# CRLF で入ると sh が "bad interpreter" や謎の構文エラーで死にます。
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.conf text eol=lf
+Dockerfile text eol=lf

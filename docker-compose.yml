@@ -1,0 +1,91 @@
+# =============================================================================
+#  VRChat HLS 配信スタック
+# =============================================================================
+#  OBS ─RTMP:1935→ mediamtx ─RTMP─→ transcoder ─HLS→ tmpfs ←─ nginx:80
+#                                                                  ↑
+#                                              既存の cloudflared ─┘
+#
+#  cloudflared はこのスタックに含みません。既存のものをそのまま使います。
+#
+#  ここの environment に並んでいるのは「運用中に変える可能性があるもの」だけです。
+#  ポートやパスのような配線は各サービスの設定ファイル側にあります:
+#    RTMP ポート   -> mediamtx.yml
+#    HTTP ポート   -> nginx/hls.conf
+#    RTMP/出力パス -> transcoder/run.sh 冒頭
+#
+#  depends_on は意図的に付けていません。transcoder は publisher が来るまで
+#  待ち続け、nginx はファイルが無ければ 404 を返すだけなので、
+#  どの順で起動しても、どれが単独で再起動しても正しい状態に収束します。
+# =============================================================================
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+services:
+
+  # OBS の送り先:  rtmp://<ホストIP>:1935/  ストリームキー origin
+  mediamtx:
+    image: bluenviron/mediamtx:1.20.0
+    container_name: vrc-mediamtx
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    logging: *logging
+
+  # RTMP を読んで HLS を書く。このスタックの心臓部。
+  transcoder:
+    build: ./transcoder
+    container_name: vrc-transcoder
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - hls:/hls
+    environment:
+      # --- 動作モード -------------------------------------------------------
+      #  copy      : 再エンコードなし。CPU ほぼ 0・遅延最小。通常はこれ。
+      #  transcode : 既知の正常値 (720p30/3.5M/main/Bフレーム無し) に強制変換。
+      #              切り分け専用。設定項目は意図的に持たせていません
+      #              (基準が可変だと基準になりません)。
+      MODE: "${MODE:-copy}"
+
+      # --- 遅延 -------------------------------------------------------------
+      #  遅延 ≒ SEG_SECONDS × 3 + 1〜2秒
+      #  OBS のキーフレーム間隔と必ず一致させること。ずれると遅延が伸びます。
+      SEG_SECONDS: "${SEG_SECONDS:-1}"
+
+      # --- 安定性 -----------------------------------------------------------
+      #  SEG_LIST_SIZE  : プレイリストに載せる本数
+      #  SEG_KEEP_EXTRA : プレイリストから外した後もディスクに残す本数
+      #
+      #  KEEP はプレイリストに載らないので、増やしても遅延は 1ms も増えません。
+      #  再生が不安定なときに最初に増やすのはここです。
+      SEG_LIST_SIZE:  "${SEG_LIST_SIZE:-8}"
+      SEG_KEEP_EXTRA: "${SEG_KEEP_EXTRA:-60}"
+
+      # --- 入力検査 ---------------------------------------------------------
+      #  配信開始時にキーフレーム間隔を実測します。この秒数ぶん開始が遅れます。
+      #  0 で無効。設定が固まるまでは有効のままを推奨。
+      GOP_CHECK_SECONDS: "${GOP_CHECK_SECONDS:-4}"
+    logging: *logging
+
+  # HLS 配信。キャッシュ制御もここで完結。
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: vrc-nginx
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./nginx/hls.conf:/etc/nginx/conf.d/default.conf:ro
+      - hls:/hls:ro
+    logging: *logging
+
+volumes:
+  # RAM ディスク。既定値だと 68 セグメント × 数百KB 程度しか載りません。
+  # tmpfs が使えない環境なら driver_opts を丸ごと削れば通常ボリュームで動きます。
+  hls:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=512m"

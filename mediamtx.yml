@@ -1,0 +1,39 @@
+# =============================================================================
+#  MediaMTX — RTMP 受け口専用
+# =============================================================================
+#  HLS はこのプロセスでは扱いません。ffmpeg に完全に移譲しています。
+#  MediaMTX は未知のキーがあると起動に失敗するので、確実に存在するキーだけ
+#  書いています。ここに無い項目はすべて既定値です。
+#
+#  network_mode: host なので、有効にしたサーバはそのままホストのポートを
+#  掴みます。使わないものを止めておくのは行儀ではなく実害の回避です。
+# =============================================================================
+
+logLevel: info
+logDestinations: [stdout]
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 1024
+
+# 使わないものは全部止める
+api: no
+metrics: no
+pprof: no
+playback: no
+rtsp: no
+webrtc: no
+srt: no
+hls: no
+
+# RTMP のみ。transcoder/run.sh の SRC と対応。
+rtmp: yes
+rtmpAddress: :1935
+rtmpEncryption: "no"
+
+paths:
+  origin:
+    source: publisher
+    # OBS が落ちて再接続してきたとき、古いセッションを上書きさせます。
+    # no にすると「まだ生きている扱いの旧セッション」に阻まれて再接続できません。
+    overridePublisher: yes
