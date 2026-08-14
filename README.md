@@ -18,7 +18,7 @@ cloudflared はこのスタックに含みません。既存のものをその�
 **先に旧スタックを落としてください。** `network_mode: host` なので、
 旧構成の MediaMTX が `:80` と `:1935` を掴んだままだと起動に失敗します。
 
-Portainer → Stacks → Add stack → **Repository**
+Portainer → Stacks → Add stack
 
 | | |
 |---|---|
@@ -26,18 +26,27 @@ Portainer → Stacks → Add stack → **Repository**
 | Compose path | `docker-compose.yml` |
 | Environment variables | 不要（全て既定値あり） |
 
-ビルドは発生しません。公開イメージを pull して `transcoder/run.sh` を
-マウントするだけです。GitOps updates を有効にすれば push で再デプロイされます。
+**`docker-compose.yml` 1 枚で完結します。** Repository でも Web エディタへの
+貼り付けでも同じように動きます。ビルドもホスト側ファイルへの依存もありません。
 
-> **なぜビルドしないのか**
-> Portainer が Docker socket proxy 越しに Docker へ繋いでいる構成だと、
-> BuildKit の gRPC セッション (`/session`) がプロキシを通れず、
-> `failed to list workers ... frame too large, note that the frame header
-> looked like an HTTP/1.1 header` でスタックのデプロイごと失敗します。
-> ビルドを無くせばこの経路を一切使いません。
+唯一の前提は Compose のバージョンです。
+
+```bash
+docker compose version
+```
+
+`v2.23.1` 以上であること。`configs` の `content`（設定のインライン埋め込み）に
+これが要ります。
+
+> **なぜ 1 枚に閉じたのか**
+> 外部ファイルを参照した構成では、デプロイが 2 回続けて別々の理由で失敗しました。
+> 1つはビルド (`failed to list workers ... frame too large`)、
+> もう1つはマウント (`not a directory: Are you trying to mount a directory
+> onto a file`)。どちらも「Portainer がリポジトリをどこに展開したか」に
+> 依存する問題です。参照するファイルが無ければ、この種の失敗は起きません。
 
 既存トンネルの Service が `http://localhost:80` を向いている想定です。
-違うポートなら `nginx/hls.conf` の `listen` を合わせてください。
+違うポートなら `configs.nginx_conf` の中の `listen` を合わせてください。
 **cloudflared 側の設定変更は不要です。**
 
 ## 2. OBS を設定する
@@ -219,15 +228,28 @@ Portainer の Environment variables に入れてください。全て既定値�
 | `SEG_KEEP_EXTRA` | `60` | 外した後も残す本数。**増やしても遅延は増えない** |
 | `GOP_CHECK_SECONDS` | `4` | キーフレーム間隔の測定時間。`0` で無効化して配信開始が 4 秒早くなる |
 
-ポートやパスのような**配線は環境変数にしていません**。設定ファイル側にあります。
+ポートやパスのような**配線は環境変数にしていません**。`configs` の中にあります。
 
 | 何を | どこに |
 |---|---|
-| RTMP ポート | `mediamtx.yml` |
-| HTTP ポート | `nginx/hls.conf` |
-| RTMP / 出力先パス | `transcoder/run.sh` 冒頭 |
+| RTMP ポート | `configs.mediamtx_yml` の `rtmpAddress` |
+| HTTP ポート | `configs.nginx_conf` の `listen` |
+| RTMP / 出力先パス | `configs.run_sh` 冒頭の `SRC` と `OUT_DIR` |
 
 一度決めたら動かさないものと、運用中に触るものを混ぜないための切り分けです。
+
+### `configs` の中を編集するときの注意
+
+`content:` の中身は Compose の変数展開を通ります。**シェルの `$` は
+すべて `$$` と書いてください。**
+
+```sh
+FPS=$$(( (RNUM + RDEN / 2) / RDEN ))    # 正しい
+FPS=$(( (RNUM + RDEN / 2) / RDEN ))     # 壊れる（空文字に置換される）
+```
+
+`configs.nginx_conf` の正規表現アンカー（`\.m3u8$$` など）も同じです。
+埋め込み時に機械的に変換してあるので、既存の記述はすべて `$$` になっています。
 
 ---
 
@@ -260,11 +282,20 @@ Windows 側の Media Foundation は無視します。
 ## 構成ファイル
 
 ```
-docker-compose.yml   3サービス。全て network_mode: host。ビルドなし
-mediamtx.yml         RTMP 受け口だけ。他のサーバは全部 off
-nginx/hls.conf       配信 + キャッシュ制御 + デバッグ用の口
-transcoder/run.sh    待機 → 検査 → 変換 のループ。イメージにマウントされる
+docker-compose.yml   これ1枚で完結
+README.md            この文書
 .gitattributes       LF 強制
+```
+
+`docker-compose.yml` の中身は 2 段になっています。
+
+```
+configs:
+  mediamtx_yml   RTMP 受け口だけ。他のサーバは全部 off
+  nginx_conf     配信 + キャッシュ制御 + デバッグ用の口
+  run_sh         待機 → 検査 → 変換 のループ
+services:
+  mediamtx / transcoder / nginx   全て network_mode: host。ビルドなし
 ```
 
 イメージは 3 つとも公開イメージで、バージョンを固定しています。
@@ -283,5 +314,6 @@ ffmpeg イメージを差し替えたくなったときに壊れにくくする�
 待ち続け、nginx はファイルが無ければ 404 を返すだけなので、どの順で起動しても、
 どれが単独で再起動しても正しい状態に収束します。
 
-`.sh` / `.yml` / `.conf` は **LF 改行必須**です。`.gitattributes` で強制しつつ、
-compose の entrypoint で実行前に `tr -d "\r"` を通す保険もかけています。
+`docker-compose.yml` は **LF 改行必須**です。埋め込みスクリプトの改行が
+そのまま実行される内容になるためで、`.gitattributes` で強制しつつ、
+entrypoint で実行前に `tr -d "\r"` を通す保険もかけています。
