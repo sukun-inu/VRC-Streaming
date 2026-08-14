@@ -26,9 +26,15 @@ Portainer → Stacks → Add stack → **Repository**
 | Compose path | `docker-compose.yml` |
 | Environment variables | 不要（全て既定値あり） |
 
-`transcoder` は Dockerfile からビルドされますが、Portainer がクローンした先が
-ビルドコンテキストになるので準備は要りません。GitOps updates を有効にすれば
-push で再デプロイされます。
+ビルドは発生しません。公開イメージを pull して `transcoder/run.sh` を
+マウントするだけです。GitOps updates を有効にすれば push で再デプロイされます。
+
+> **なぜビルドしないのか**
+> Portainer が Docker socket proxy 越しに Docker へ繋いでいる構成だと、
+> BuildKit の gRPC セッション (`/session`) がプロキシを通れず、
+> `failed to list workers ... frame too large, note that the frame header
+> looked like an HTTP/1.1 header` でスタックのデプロイごと失敗します。
+> ビルドを無くせばこの経路を一切使いません。
 
 既存トンネルの Service が `http://localhost:80` を向いている想定です。
 違うポートなら `nginx/hls.conf` の `listen` を合わせてください。
@@ -254,17 +260,28 @@ Windows 側の Media Foundation は無視します。
 ## 構成ファイル
 
 ```
-docker-compose.yml     3サービス。全て network_mode: host
-mediamtx.yml           RTMP 受け口だけ。他のサーバは全部 off
-nginx/hls.conf         配信 + キャッシュ制御 + デバッグ用の口
-transcoder/Dockerfile  alpine + ffmpeg
-transcoder/run.sh      待機 → 検査 → 変換 のループ
-.gitattributes         LF 強制
+docker-compose.yml   3サービス。全て network_mode: host。ビルドなし
+mediamtx.yml         RTMP 受け口だけ。他のサーバは全部 off
+nginx/hls.conf       配信 + キャッシュ制御 + デバッグ用の口
+transcoder/run.sh    待機 → 検査 → 変換 のループ。イメージにマウントされる
+.gitattributes       LF 強制
 ```
+
+イメージは 3 つとも公開イメージで、バージョンを固定しています。
+
+| | |
+|---|---|
+| `bluenviron/mediamtx:1.20.0` | RTMP 受け口 |
+| `jrottenberg/ffmpeg:8.1.2-ubuntu2404` | `run.sh` の実行環境 |
+| `nginx:1.27-alpine` | HLS 配信 |
+
+`run.sh` が使う外部コマンドは `ffmpeg` / `ffprobe` / `find` / `grep` / `date`
+だけです。計算はすべてシェルの整数演算で `awk` にも依存しません。
+ffmpeg イメージを差し替えたくなったときに壊れにくくするためです。
 
 `depends_on` は意図的に付けていません。transcoder は publisher が来るまで
 待ち続け、nginx はファイルが無ければ 404 を返すだけなので、どの順で起動しても、
 どれが単独で再起動しても正しい状態に収束します。
 
 `.sh` / `.yml` / `.conf` は **LF 改行必須**です。`.gitattributes` で強制しつつ、
-`transcoder/Dockerfile` 内の `sed` でも保険をかけています。
+compose の entrypoint で実行前に `tr -d "\r"` を通す保険もかけています。

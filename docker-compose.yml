@@ -35,13 +35,25 @@ services:
     logging: *logging
 
   # RTMP を読んで HLS を書く。このスタックの心臓部。
+  #
+  #  ビルドはしません。Portainer が Docker socket proxy 越しに繋いでいる構成だと
+  #  BuildKit の gRPC セッションがプロキシを通れず、スタックのデプロイごと
+  #  失敗します。公開イメージ + スクリプトのマウントなら pull するだけで済みます。
   transcoder:
-    build: ./transcoder
+    image: jrottenberg/ffmpeg:8.1.2-ubuntu2404
     container_name: vrc-transcoder
     restart: unless-stopped
     network_mode: host
+    init: true          # PID 1 を docker-init に。ゾンビ回収と signal 転送のため
     volumes:
+      - ./transcoder/run.sh:/opt/run.sh:ro
       - hls:/hls
+    # このイメージの ENTRYPOINT は ffmpeg 本体なので上書きします。
+    # run.sh が CRLF で入っていても動くよう、実行前に CR を落としています。
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'tr -d "\r" < /opt/run.sh > /tmp/run.sh; exec sh /tmp/run.sh'
     environment:
       # --- 動作モード -------------------------------------------------------
       #  copy      : 再エンコードなし。CPU ほぼ 0・遅延最小。通常はこれ。

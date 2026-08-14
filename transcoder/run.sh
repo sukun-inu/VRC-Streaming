@@ -4,6 +4,10 @@
 # =============================================================================
 #  publisher(OBS) が来るまで待ち、来たら変換し、切れたらまた待つ。
 #  この3状態しかありません。どこで死んでも待機状態に戻ります。
+#
+#  外部コマンドは ffmpeg / ffprobe / find / grep / date のみ。計算はすべて
+#  シェルの整数演算で済ませてあり awk にも依存しません。
+#  ベースイメージを差し替えても壊れにくくするためです。
 # =============================================================================
 set -u
 
@@ -19,12 +23,23 @@ KEEP="${SEG_KEEP_EXTRA:-60}"
 GOP_CHECK="${GOP_CHECK_SECONDS:-4}"
 
 PLAYLIST="${OUT_DIR}/index.m3u8"
+FFPID=""
 
 log()  { echo "[$(date -u '+%H:%M:%S')] $*"; }
 warn() { echo "[$(date -u '+%H:%M:%S')] !! $*"; }
 
+# 数値かどうか。これを通さずに $(( )) へ渡すと、想定外の入力でシェルごと落ちます。
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+for c in ffmpeg ffprobe; do
+  command -v "$c" >/dev/null || { echo "FATAL: ${c} が見つかりません"; exit 1; }
+done
+
 mkdir -p "$OUT_DIR"
-trap 'rm -f "$PLAYLIST"; exit 0' TERM INT
+
+# ffmpeg はバックグラウンドで動かして wait で待ちます。前面で動かすと停止シグナルを
+# 受けてもこの trap が ffmpeg の終了まで走らず、停止に10秒待たされます。
+trap '[ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null; rm -f "$PLAYLIST"; exit 0' TERM INT
 
 log "mode=${MODE} segment=${SEG}s window=$(( SEG * LIST ))s grace=$(( SEG * KEEP ))s latency~$(( SEG * 3 + 2 ))s"
 
@@ -59,7 +74,13 @@ while :; do
   IFS=, read -r VCODEC VPROF VW VH VRATE VPIX <<EOF
 $V
 EOF
-  FPS=$(awk -v r="${VRATE:-0/1}" 'BEGIN{split(r,a,"/"); print (a[2]>0)? int(a[1]/a[2]+0.5) : 0}')
+
+  # r_frame_rate は "30/1" や "30000/1001" の形。四捨五入して整数 fps にする。
+  FPS=0
+  RNUM="${VRATE%%/*}"; RDEN="${VRATE##*/}"
+  if is_num "$RNUM" && is_num "$RDEN" && [ "$RDEN" -gt 0 ]; then
+    FPS=$(( (RNUM + RDEN / 2) / RDEN ))
+  fi
 
   if [ -n "$A" ]; then
     IFS=, read -r ACODEC ARATE ACH <<EOF
@@ -82,9 +103,9 @@ EOF
     fi
     [ "$VPIX" = "yuv420p" ] || warn "pix_fmt が ${VPIX}。Quest は yuv420p しか再生できません"
     [ -n "$ACODEC" ] && [ "$ACODEC" != "aac" ] && warn "音声が ${ACODEC}。VRChat は AAC のみ"
-    [ "${VW:-0}" -gt 1920 ] 2>/dev/null && warn "横 ${VW}px。Quest 向けには 1920 以下を推奨"
-    [ "${VH:-0}" -gt 1080 ] 2>/dev/null && warn "縦 ${VH}px。Quest 向けには 1080 以下を推奨"
-    [ "${FPS:-0}" -gt 30 ] 2>/dev/null && [ "${VH:-0}" -gt 720 ] 2>/dev/null &&
+    is_num "$VW" && [ "$VW" -gt 1920 ] && warn "横 ${VW}px。Quest 向けには 1920 以下を推奨"
+    is_num "$VH" && [ "$VH" -gt 1080 ] && warn "縦 ${VH}px。Quest 向けには 1080 以下を推奨"
+    is_num "$VH" && [ "$FPS" -gt 30 ] && [ "$VH" -gt 720 ] &&
       warn "${VW}x${VH}@${FPS} は Quest だと描画とデコーダが競合しやすい"
   fi
 
@@ -93,17 +114,20 @@ EOF
   #    OBS のキーフレーム間隔が SEG_SECONDS と違うと、ffmpeg は指定どおりに
   #    切れず OBS 側の間隔で切ります。遅延がそのぶん伸びます。
   #    「なぜか遅延が想定の倍」はほぼこれです。
+  #
+  #    小数を扱わずに済むよう、すべて 1/10 秒単位の整数で計算しています。
   # ---------------------------------------------------------------------------
-  if [ "$GOP_CHECK" -gt 0 ] 2>/dev/null; then
+  if is_num "$GOP_CHECK" && [ "$GOP_CHECK" -gt 0 ]; then
     KF=$(ffprobe -v error -select_streams v:0 -read_intervals "%+${GOP_CHECK}" \
            -show_entries frame=key_frame -of csv=p=0 "$SRC" 2>/dev/null | grep -c '^1')
-    if [ "${KF:-0}" -gt 0 ]; then
-      EST=$(awk -v p="$GOP_CHECK" -v k="$KF" 'BEGIN{printf "%.1f", p/k}')
-      log "keyframe interval: 約 ${EST}s"
-      if awk -v e="$EST" -v s="$SEG" 'BEGIN{exit !(e > s*1.3 || e < s*0.7)}'; then
-        warn "キーフレーム間隔 ${EST}s が SEG_SECONDS=${SEG}s と一致していません"
+    if is_num "$KF" && [ "$KF" -gt 0 ]; then
+      EST10=$(( GOP_CHECK * 10 / KF ))          # 例: 4秒に2枚 -> 20 (=2.0秒)
+      log "keyframe interval: 約 $(( EST10 / 10 )).$(( EST10 % 10 ))s"
+      # 許容 ±30%。EST10 は10倍値なので閾値も10倍で比較する。
+      if [ "$EST10" -gt $(( SEG * 13 )) ] || [ "$EST10" -lt $(( SEG * 7 )) ]; then
+        warn "キーフレーム間隔が SEG_SECONDS=${SEG}s と一致していません"
         warn "  OBS の「キーフレーム間隔」を ${SEG} 秒にしてください"
-        warn "  このままだと遅延が約 $(awk -v e="$EST" 'BEGIN{printf "%.0f", e*3+2}')s になります"
+        warn "  このままだと遅延が約 $(( EST10 * 3 / 10 + 2 ))s になります"
       fi
     fi
   fi
@@ -172,7 +196,11 @@ EOF
     -hls_flags delete_segments+omit_endlist+temp_file \
     -hls_segment_type mpegts \
     -hls_segment_filename "${OUT_DIR}/${RUN}_%06d.ts" \
-    "$PLAYLIST"
+    "$PLAYLIST" &
+
+  FFPID=$!
+  wait "$FFPID"
+  FFPID=""
 
   # プレイリストを消します。残すと「配信中に見えるのに全セグメント404」という
   # 一番わかりにくい状態になります。
