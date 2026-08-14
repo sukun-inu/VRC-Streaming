@@ -370,7 +370,7 @@ configs:
       </body>
       </html>
 
-  on_available_sh_20260814b:
+  on_available_sh_20260814c:
     content: |
       #!/bin/sh
       # =============================================================================
@@ -577,6 +577,16 @@ configs:
       #
       #   temp_file : .tmp に書いてから rename。書きかけを nginx が配る事故を防ぐ。
       #   master playlist は作りません (単一レンディションなので不要)。
+      #
+      #   hls_base_url が要ります。ffmpeg は既定だとセグメントをファイル名
+      #   だけの相対参照 (例: 20260814_000038.ts) で書きます。プレイヤーは
+      #   これを「プレイリスト自身のURL」基準で解決するので、案内ページの
+      #   短縮URL (/<キー>、末尾スラッシュなし) でプレイリストを取得すると
+      #   末尾の "<キー>" がファイル名扱いされて消え、/<キー>/xxx.ts では
+      #   なく /xxx.ts を探しにいって 404 になります (実際にこの事故が
+      #   起きました)。hls_base_url でセグメント参照を /<キー>/xxx.ts と
+      #   ルート相対の絶対パスにしてしまえば、プレイリストをどの末尾の
+      #   URLで取得しても解決がぶれません。
       # ---------------------------------------------------------------------------
       RUN="$$(date -u +%Y%m%d%H%M%S)"
       log "starting ffmpeg (run=$${RUN})"
@@ -592,6 +602,7 @@ configs:
         -hls_delete_threshold "$$KEEP" \
         -hls_flags delete_segments+omit_endlist+temp_file \
         -hls_segment_type mpegts \
+        -hls_base_url "/$${KEY}/" \
         -hls_segment_filename "$${OUT_DIR}/$${RUN}_%06d.ts" \
         "$$PLAYLIST" &
 
@@ -618,7 +629,7 @@ services:
     configs:
       - source: mediamtx_yml_20260814
         target: /mediamtx.yml
-      - source: on_available_sh_20260814b
+      - source: on_available_sh_20260814c
         target: /opt/on_available.sh
     environment:
       # --- 動作モード -------------------------------------------------------
