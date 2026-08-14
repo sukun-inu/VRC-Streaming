@@ -31,8 +31,9 @@
 #
 #  ■ configs の content を変更したら、名前の日付を今日の日付に変えること
 #     (例: nginx_conf_20260814 → nginx_conf_20260901。services 側の
-#     source: も同じ名前に書き換える。同じ日に2回編集したら
-#     nginx_conf_20260814b のように英字を足して区別する)
+#     source: も同じ名前に書き換える。同じ日に2回目の編集をしたら
+#     nginx_conf_20260814b のように英字を足して区別する。3回目なら
+#     20260814c、のように増やす)
 #
 #     Docker Compose には既知の制限があり、config の名前を変えずに
 #     content だけ変更しても、通常の再デプロイ (docker compose up -d や
@@ -120,7 +121,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814b:
+  nginx_conf_20260814d:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -131,8 +132,9 @@ configs:
       #  キャッシュ制御をここで完結させています。Cloudflare 側のキャッシュルールが
       #  未設定でも壊れません (入れても二重に効くだけで害はありません)。
       #
-      #  URL は配信キーごとに /<キー>/index.m3u8 です。固定パスの /live/ は
-      #  もうありません。ルート(/) はキーから再生URLを組み立てる案内ページです。
+      #  URL は配信キーごとに /<キー> です (実体は /<キー>/index.m3u8 への
+      #  内部リライト)。固定パスの /live/ はもうありません。ルート(/) は
+      #  キーから再生URLを組み立てる案内ページです。
       # =============================================================================
 
       server {
@@ -147,19 +149,44 @@ configs:
           #  マウント先は /usr/share/nginx/html (イメージに元から存在する docroot)。
           #  存在しないディレクトリ (例: /etc/nginx/html) を新規にマウント対象にすると、
           #  Docker がファイルの代わりにディレクトリを作ってしまうことがあり、
-          #  alias がそのディレクトリを指して nginx が 500 (EISDIR) を返します。
+          #  alias がそのディレクトリを指して nginx が 500 (EISDIR) を返すことがあります。
           #
-          #  alias はディレクトリ (末尾 / まで) を指し、ファイル名は書きません。
-          #  location = / のように URI が「/」で終わる場所で alias に
-          #  ファイル名まで書くと、nginx が index ディレクティブの値を
-          #  無条件に後ろへ連結してしまい、
-          #  /usr/share/nginx/html/index.htmlindex.html のような壊れたパスを
-          #  探しにいって 500 になります (alias + 末尾スラッシュURIの既知の罠)。
-          #  ディレクトリを指せば、中の index.html への解決は index
-          #  ディレクティブ (nginx.conf の既定で index.html) に任せられます。
+          #  alias はここでは使いません。alias + 「URIが / で終わる location」
+          #  は index ディレクティブとの組み合わせが罠だらけです:
+          #    - alias にファイル名まで書く (alias .../index.html) と、index
+          #      ディレクティブの値がそのまま後ろへ文字列連結されて
+          #      index.htmlindex.html のような壊れたパスになり 500。
+          #    - alias をディレクトリ (末尾 /) にして index 解決に任せると、
+          #      index モジュールは内部的に「URI + index ファイル名」
+          #      (この場合 /index.html) へ作り直してから location の
+          #      マッチングをやり直します。/index.html にマッチする
+          #      location を用意していないと、他の location (ここでは
+          #      catch-all の return 404;) に拾われて 404 になります。
+          #  root + try_files ならどちらの罠も踏みません。try_files は
+          #  location の外に出ずに指定したファイルを直接開くだけです。
           location = / {
               default_type text/html;
-              alias /usr/share/nginx/html/;
+              root /usr/share/nginx/html;
+              try_files /index.html =404;
+          }
+
+          # --- 再生URL: /<キー> だけで再生できるようにする -------------------------
+          #  実体は /<キー>/index.m3u8 (ffmpeg の出力そのまま) ですが、
+          #  VRChat に貼るURLとしては拡張子までの生パスを見せたくないので、
+          #  ここで内部的に書き換えます。rewrite ... last; はサーバ内部だけの
+          #  付け替えで、クライアントには 3xx リダイレクトとして見えません
+          #  (VRChat 側は最初の1回のリクエストで直接200を受け取ります)。
+          #  書き換えた先の /<キー>/index.m3u8 は、下の \.m3u8$$ location に
+          #  そのまま拾われるので、キャッシュ制御ヘッダもそちらで一元管理
+          #  されたままです。
+          #
+          #  マッチさせるキーの文字種・長さは configs.mediamtx_yml の
+          #  path 正規表現と揃えてあります (半角英数字・ハイフン・
+          #  アンダースコア、6〜32文字)。/healthz のような他の固定パスは
+          #  exact match (location = ...) が regex より必ず先に評価される
+          #  ので、ここに拾われる心配はありません。
+          location ~ ^/([A-Za-z0-9_-]{6,32})$$ {
+              rewrite ^ /$$1/index.m3u8 last;
           }
 
           # --- プレイリスト: 絶対にキャッシュさせない ------------------------------
@@ -210,7 +237,7 @@ configs:
           access_log off;
       }
 
-  landing_html_20260814:
+  landing_html_20260814b:
     content: |
       <!doctype html>
       <html lang="ja">
@@ -296,7 +323,7 @@ configs:
           var key = input.value.trim();
           if (!key) { input.focus(); return; }
           warnEl.className = KEY_RE.test(key) ? 'warn' : 'warn show';
-          var url = location.origin + '/' + encodeURIComponent(key) + '/index.m3u8';
+          var url = location.origin + '/' + encodeURIComponent(key);
           urlEl.textContent = url;
           result.className = 'result show';
           copyBtn.textContent = 'コピー';
@@ -613,9 +640,9 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814b
+      - source: nginx_conf_20260814d
         target: /etc/nginx/conf.d/default.conf
-      - source: landing_html_20260814
+      - source: landing_html_20260814b
         target: /usr/share/nginx/html/index.html
     logging: *logging
 
