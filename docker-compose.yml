@@ -121,7 +121,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814d:
+  nginx_conf_20260814f:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -185,8 +185,22 @@ configs:
           #  アンダースコア、6〜32文字)。/healthz のような他の固定パスは
           #  exact match (location = ...) が regex より必ず先に評価される
           #  ので、ここに拾われる心配はありません。
-          location ~ ^/([A-Za-z0-9_-]{6,32})$$ {
-              rewrite ^ /$$1/index.m3u8 last;
+          #
+          #  正規表現はダブルクォートで囲むこと。nginx の設定パーサーは
+          #  クォートしていないトークンの中の { を量指定子ではなく
+          #  ブロック開始として読んでしまい、{6,32} の { で正規表現が
+          #  そこで切れて "missing closing parenthesis" になります
+          #  (実際に一度この事故を起こしました)。
+          #
+          #  rewrite 側でも自分の正規表現で $$1 を取り直すこと。location の
+          #  regex が拾った $$1 は、rewrite 自身の正規表現マッチが起きた
+          #  時点で上書きされて空になります (location の外側にある $$1 は
+          #  rewrite の中では参照できない、が正確なところ)。ここを
+          #  `rewrite ^ /$$1/...` と書くと $$1 が空文字列になり、
+          #  //index.m3u8 という壊れたパスを探しにいって 404 になります
+          #  (実機で確認して一度事故りました)。
+          location ~ "^/([A-Za-z0-9_-]{6,32})$$" {
+              rewrite "^/(.+)$$" /$$1/index.m3u8 last;
           }
 
           # --- プレイリスト: 絶対にキャッシュさせない ------------------------------
@@ -640,7 +654,7 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814d
+      - source: nginx_conf_20260814f
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814b
         target: /usr/share/nginx/html/index.html
