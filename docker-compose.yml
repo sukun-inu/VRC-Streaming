@@ -122,7 +122,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814i:
+  nginx_conf_20260814j:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -168,7 +168,9 @@ configs:
           #      (この場合 /index.html) へ作り直してから location の
           #      マッチングをやり直します。/index.html にマッチする
           #      location を用意していないと、他の location (ここでは
-          #      catch-all の return 404;) に拾われて 404 になります。
+          #      catch-all の location /) に拾われます。この catch-all は
+          #      404 ではなく / へ302リダイレクトするので、/ 自体が同じ
+          #      理由で壊れていれば、そのままリダイレクトループになります。
           #  root + try_files ならどちらの罠も踏みません。try_files は
           #  location の外に出ずに指定したファイルを直接開くだけです。
           location = / {
@@ -223,7 +225,16 @@ configs:
           }
 
           location = /healthz { return 200 "ok\n"; }
-          location / { return 404; }
+
+          # --- それ以外: 404 を出さず案内ページへ誘導 ------------------------------
+          #  .m3u8 / .ts / /clock / /healthz のどれにも一致しない未知のパスは
+          #  ここに落ちます (この location は最長一致の prefix "/" なので、
+          #  上の regex location に一致しなかったものだけがここに来ます)。
+          #  素の 404 を返す代わりに / (配信キー入力の案内ページ) へ302
+          #  リダイレクトします。301 にしないのは、ブラウザに恒久キャッシュ
+          #  させたくないからです (将来そのパスに意味を持たせる可能性を
+          #  潰さないため)。
+          location / { return 302 /; }
       }
 
       # =============================================================================
@@ -693,15 +704,27 @@ services:
     logging: *logging
 
   # HLS 配信。キャッシュ制御と案内ページもここで完結。
+  #
+  # イメージはバージョンを固定せず stable-alpine (安定版のAlpineビルド)
+  # を常に追従します。nginx の stable 系列は新機能を追加せずバグ修正・
+  # セキュリティ修正のみが入るので、自動更新の対象にしても新機能起因の
+  # 予期しない挙動変化が起きにくいです。mainline 系列 (latest / alpine
+  # タグ) は新機能も入るぶんそのリスクが上がるので、あえて選んでいません。
+  #
+  # pull_policy: always が無いと、イメージタグを浮動にしても
+  # docker compose up -d はローカルにある古いイメージを使い続けます
+  # (`docker compose pull` を別途明示的に叩いた場合を除く)。これを
+  # 付けて初めて、再デプロイのたびに実際にレジストリを見に行きます。
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:stable-alpine
+    pull_policy: always
     container_name: vrc-nginx
     restart: unless-stopped
     network_mode: host
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814i
+      - source: nginx_conf_20260814j
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814c
         target: /usr/share/nginx/html/index.html
