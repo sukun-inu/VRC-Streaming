@@ -59,7 +59,7 @@ x-logging: &logging
 
 configs:
 
-  mediamtx_yml_20260814:
+  mediamtx_yml_20260814b:
     content: |
       # =============================================================================
       #  MediaMTX — RTMP 受け口 + 配信キーごとの HLS 変換
@@ -92,6 +92,7 @@ configs:
       webrtc: no
       srt: no
       hls: no
+      moq: no
 
       # RTMP のみ。on_available.sh の SRC (rtmp://127.0.0.1:1935/<キー>) と対応。
       rtmp: yes
@@ -121,7 +122,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814h:
+  nginx_conf_20260814i:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -210,9 +211,11 @@ configs:
           #  ミリ秒表示の時計が焼き込まれます。PC と Quest で同時に再生し、
           #  両方の画面を1枚の写真に収めれば、映っている時計の差がそのまま
           #  「両者の遅延差」になります。README の「遅延は既に下限」参照。
-          #  exact match なので、これがキー名の正規表現 (~^[A-Za-z0-9_-]{6,32}$)
-          #  に一致してしまっても (実際 "clock" は6文字で一致します)、
-          #  exact match は regex より必ず先に評価されるので奪われません。
+          #  exact match なので、たとえ配信キー(6〜32文字)と同名になり得ても
+          #  (例: "healthz" は7文字なので配信キーとして使用可)、
+          #  exact match は regex より必ず先に評価されるため奪われません。
+          #  ("clock" 自体は5文字しかなく、配信キーの最小文字数(6文字)に
+          #   届かないため、そもそも配信キーにはなり得ません)
           location = /clock {
               default_type text/html;
               root /usr/share/nginx/html;
@@ -660,7 +663,7 @@ services:
     volumes:
       - hls:/hls
     configs:
-      - source: mediamtx_yml_20260814
+      - source: mediamtx_yml_20260814b
         target: /mediamtx.yml
       - source: on_available_sh_20260814c
         target: /opt/on_available.sh
@@ -698,7 +701,7 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814h
+      - source: nginx_conf_20260814i
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814c
         target: /usr/share/nginx/html/index.html
