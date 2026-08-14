@@ -734,7 +734,7 @@ configs:
       rm -rf "$$OUT_DIR"
       log "ffmpeg exited"
 
-  stats_py_20260814:
+  stats_py_20260814b:
     content: |
       #!/usr/bin/env python3
       # =============================================================================
@@ -989,15 +989,17 @@ configs:
           padding: 24px;
         }
         header { max-width: 960px; margin: 0 auto 20px; }
-        h1 { font-size: 20px; margin: 0 0 4px; }
+        .title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 4px; }
+        h1 { font-size: 20px; margin: 0; }
         .sub { color: var(--sub); font-size: 13px; line-height: 1.6; }
         .summary { display: flex; gap: 18px; margin-top: 12px; flex-wrap: wrap; }
         .stat { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
                 padding: 10px 16px; font-size: 13px; }
         .stat b { font-size: 18px; display: block; }
-        #conn { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); }
-        #conn.ok { color: var(--live); }
-        #conn.error { color: var(--err); }
+        #conn { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border);
+                color: var(--sub); }
+        #conn.ok { color: var(--live); border-color: var(--live); }
+        #conn.error { color: var(--err); border-color: var(--err); }
         main { max-width: 960px; margin: 0 auto; display: grid; gap: 14px; }
         .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
         .card h2 { margin: 0 0 8px; font-size: 15px; display: flex; align-items: center; gap: 10px; }
@@ -1016,7 +1018,10 @@ configs:
       </head>
       <body>
       <header>
-        <h1>配信状況ダッシュボード</h1>
+        <div class="title-row">
+          <h1>配信状況ダッシュボード</h1>
+          <span id="conn">-</span>
+        </div>
         <p class="sub">
           自宅LAN内向け。1.5秒ごとに自動更新します。視聴者は一定時間 (既定8秒)
           アクセスが無いと一覧から消えます。逆引きは相手のISP/ルーターの設定次第
@@ -1025,7 +1030,7 @@ configs:
         <div class="summary">
           <div class="stat"><b id="liveCount">-</b>配信中</div>
           <div class="stat"><b id="viewerCount">-</b>視聴中(合計)</div>
-          <div class="stat"><b id="updated">-</b>最終更新<div><span id="conn">-</span></div></div>
+          <div class="stat"><b id="updated">-</b>最終更新</div>
         </div>
       </header>
       <main id="streams"></main>
@@ -1292,7 +1297,7 @@ services:
   # から直接配っているため) — nginx のアクセスログを syslog (UDP,
   # 127.0.0.1:19514) でこのサービスへ直接送ってもらい、そこから拾って
   # います。状態はすべてメモリ上だけで、永続化はしません。詳しい設計は
-  # スクリプト本体 (下の stats_py_20260814) 冒頭のコメント参照。
+  # スクリプト本体 (下の stats_py_20260814b) 冒頭のコメント参照。
   #
   # LAN内向け (0.0.0.0 bind)。cloudflared のトンネルには乗せていません。
   # イメージは nginx と同じ理由でバージョン固定せず最新の3系に追従します
@@ -1304,7 +1309,7 @@ services:
     restart: unless-stopped
     network_mode: host
     configs:
-      - source: stats_py_20260814
+      - source: stats_py_20260814b
         target: /opt/stats.py
     environment:
       # alpine (musl) はロケール未設定だと標準出力が ascii にフォールバック
