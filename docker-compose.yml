@@ -56,11 +56,14 @@
 #  ■ 視聴者の実IPについて
 #     cloudflared はこのホストへローカル接続で中継してくるだけなので、
 #     何もしなければ nginx から見えるアクセス元は全員 cloudflared 自身に
-#     なってしまいます。nginx.conf で Cloudflare の CF-Connecting-IP
-#     ヘッダーから実際のアクセス元IPを復元しています。nginx 自身は
-#     リクエストのたびに同期的な逆引き (DNS PTR) はしません — Apache の
-#     HostnameLookups が非推奨とされているのと同じ理由です。逆引き済みで
-#     見たい場合は上のダッシュボードを使ってください。
+#     なってしまいます。nginx.conf で Cloudflare の X-Forwarded-For
+#     ヘッダー (の末尾の値) から実際のアクセス元IPを復元しています
+#     (実機で CF-Connecting-IP を試したところレスポンス側で消えてしまう
+#     現象があり、X-Forwarded-For に切り替えました。詳細は nginx.conf の
+#     コメント参照)。nginx 自身はリクエストのたびに同期的な逆引き
+#     (DNS PTR) はしません — Apache の HostnameLookups が非推奨とされて
+#     いるのと同じ理由です。逆引き済みで見たい場合は上のダッシュボードを
+#     使ってください。
 #
 #  ■ 注意
 #     network_mode: host なので、旧スタックが :80 や :1935 を掴んだままだと
@@ -145,7 +148,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814l:
+  nginx_conf_20260814m:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -179,14 +182,23 @@ configs:
 
           # cloudflared はこのホストへローカル接続で中継してくるだけなので、
           # 何もしなければ $$remote_addr は視聴者のIPではなく cloudflared 自身
-          # (127.0.0.1) になってしまいます。Cloudflare はエッジで
-          # CF-Connecting-IP ヘッダーに本来の接続元IPを入れて転送してくる
-          # ので、ループバックからの接続に限ってそれを信用して $$remote_addr を
-          # 復元します (LAN内の他端末がこのヘッダーを偽装しても、ループバック
-          # からの接続でなければ無視されるので効きません)。
+          # (127.0.0.1) になってしまいます。
+          #
+          # 当初 CF-Connecting-IP ヘッダーを使う設定にしていましたが、実機の
+          # cloudflared 環境で検証したところ、このヘッダーだけがレスポンス側で
+          # 消えてしまい (X-Debug-* で可視化して確認)、代わりに X-Forwarded-For
+          # には正しい接続元IPが乗っていることを確認したため、こちらを使って
+          # います。X-Forwarded-For はクライアントが偽の値を仕込んでいても、
+          # Cloudflare が自分の観測した接続元IPを必ず「末尾に追記」します
+          # (上書きしない)。real_ip_recursive off は「ヘッダーの末尾の値」を
+          # 採用するので、クライアントが最初にいくつ偽物を並べても、最後に
+          # 足される Cloudflare 観測値だけが使われ、なりすませません。
+          # ループバックからの接続に限ってこのヘッダーを信用するので、LAN内の
+          # 他端末が直接ヘッダーを偽装しても (ループバック経由でなければ)
+          # 無視されます。
           set_real_ip_from 127.0.0.1;
           set_real_ip_from ::1;
-          real_ip_header CF-Connecting-IP;
+          real_ip_header X-Forwarded-For;
           real_ip_recursive off;
 
           # 視聴者数 × 1秒2リクエスト程度のペースでログが出ます。下の
@@ -1262,7 +1274,7 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814l
+      - source: nginx_conf_20260814m
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814c
         target: /usr/share/nginx/html/index.html
