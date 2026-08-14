@@ -121,7 +121,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814f:
+  nginx_conf_20260814g:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -232,6 +232,20 @@ configs:
               add_header Access-Control-Allow-Origin "*" always;
           }
 
+          # --- 遅延測定用のミリ秒時計 ------------------------------------------------
+          #  OBS のシーンにブラウザソースとしてこの URL を追加すると、配信映像に
+          #  ミリ秒表示の時計が焼き込まれます。PC と Quest で同時に再生し、
+          #  両方の画面を1枚の写真に収めれば、映っている時計の差がそのまま
+          #  「両者の遅延差」になります。README の「遅延は既に下限」参照。
+          #  exact match なので、これがキー名の正規表現 (~^[A-Za-z0-9_-]{6,32}$)
+          #  に一致してしまっても (実際 "clock" は6文字で一致します)、
+          #  exact match は regex より必ず先に評価されるので奪われません。
+          location = /clock {
+              default_type text/html;
+              root /usr/share/nginx/html;
+              try_files /clock.html =404;
+          }
+
           location = /healthz { return 200 "ok\n"; }
           location / { return 404; }
       }
@@ -250,6 +264,52 @@ configs:
           autoindex on;
           access_log off;
       }
+
+  clock_html_20260814:
+    content: |
+      <!doctype html>
+      <html lang="ja">
+      <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>遅延測定用クロック</title>
+      <style>
+        html, body {
+          margin: 0; padding: 0; width: 100%; height: 100%;
+          background: #000; overflow: hidden;
+        }
+        .clock {
+          position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+          font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+          font-size: min(14vw, 18vh);
+          font-weight: 700;
+          color: #fff;
+          letter-spacing: 0.02em;
+          white-space: nowrap;
+        }
+        .hint {
+          position: fixed; left: 12px; bottom: 8px;
+          font-family: -apple-system, "Segoe UI", sans-serif;
+          font-size: 12px; color: #555;
+        }
+      </style>
+      </head>
+      <body>
+        <div class="clock" id="clock">--:--:--.---</div>
+        <div class="hint">OBS のシーンにブラウザソースとして追加 → PC/Questで同時再生 → 両画面を1枚の写真に収めて時計の差を見る</div>
+      <script>
+        var el = document.getElementById('clock');
+        function pad(n, len) { n = String(n); while (n.length < len) n = '0' + n; return n; }
+        function tick() {
+          var d = new Date();
+          el.textContent = pad(d.getHours(), 2) + ':' + pad(d.getMinutes(), 2) + ':' +
+                            pad(d.getSeconds(), 2) + '.' + pad(d.getMilliseconds(), 3);
+          requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+      </script>
+      </body>
+      </html>
 
   landing_html_20260814b:
     content: |
@@ -665,10 +725,12 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814f
+      - source: nginx_conf_20260814g
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814b
         target: /usr/share/nginx/html/index.html
+      - source: clock_html_20260814
+        target: /usr/share/nginx/html/clock.html
     logging: *logging
 
 volumes:

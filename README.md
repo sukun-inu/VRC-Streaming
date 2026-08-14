@@ -181,6 +181,10 @@ OBS のシーンにミリ秒表示の時計を出し、PC と Quest で同時再
 両方の画面を1枚の写真に収める。これで**両者のズレ**も同時に取れます。
 同時視聴が目的である以上、絶対遅延よりそちらのほうが重要です。
 
+その時計用に `https://<トンネルのホスト名>/clock` を用意してあります。
+OBS のシーンにブラウザソースとして追加するだけで、配信映像にミリ秒表示の
+時計が焼き込まれます。自分で時計素材を用意する必要はありません。
+
 ### なぜキーごとに ffmpeg を都度起動する形にしたのか
 
 以前は「決め打ちの1本のパス」に対して、別コンテナが ffprobe で
@@ -430,7 +434,8 @@ README.md            この文書
 configs:
   mediamtx_yml     RTMP 受け口 + 配信キーごとの runOnAvailable フック
   nginx_conf       配信 + キャッシュ制御 + デバッグ用の口
-  landing_html     配信キーから再生URLを組み立てる案内ページ
+  landing_html     配信キーから再生URLを組み立てる案内ページ (/)
+  clock_html       遅延測定用のミリ秒時計 (/clock)。OBSのブラウザソース用
   on_available_sh  1配信キー分の 検査 → 変換 (runOnAvailable から起動)
 services:
   mediamtx / nginx   全て network_mode: host。ビルドなし
