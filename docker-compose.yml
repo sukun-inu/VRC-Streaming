@@ -120,7 +120,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814:
+  nginx_conf_20260814b:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -148,9 +148,18 @@ configs:
           #  存在しないディレクトリ (例: /etc/nginx/html) を新規にマウント対象にすると、
           #  Docker がファイルの代わりにディレクトリを作ってしまうことがあり、
           #  alias がそのディレクトリを指して nginx が 500 (EISDIR) を返します。
+          #
+          #  alias はディレクトリ (末尾 / まで) を指し、ファイル名は書きません。
+          #  location = / のように URI が「/」で終わる場所で alias に
+          #  ファイル名まで書くと、nginx が index ディレクティブの値を
+          #  無条件に後ろへ連結してしまい、
+          #  /usr/share/nginx/html/index.htmlindex.html のような壊れたパスを
+          #  探しにいって 500 になります (alias + 末尾スラッシュURIの既知の罠)。
+          #  ディレクトリを指せば、中の index.html への解決は index
+          #  ディレクティブ (nginx.conf の既定で index.html) に任せられます。
           location = / {
               default_type text/html;
-              alias /usr/share/nginx/html/index.html;
+              alias /usr/share/nginx/html/;
           }
 
           # --- プレイリスト: 絶対にキャッシュさせない ------------------------------
@@ -320,7 +329,7 @@ configs:
       </body>
       </html>
 
-  on_available_sh_20260814:
+  on_available_sh_20260814b:
     content: |
       #!/bin/sh
       # =============================================================================
@@ -390,7 +399,7 @@ configs:
       # ---------------------------------------------------------------------------
       V=$$(ffprobe -v error -select_streams v:0 -analyzeduration 2000000 -probesize 2000000 \
             -show_entries stream=codec_name,profile,width,height,r_frame_rate,pix_fmt \
-            -of csv=p=0 "$$SRC" 2>/dev/null)
+            -of default=noprint_wrappers=1 "$$SRC" 2>/dev/null)
       if [ -z "$$V" ]; then
         warn "ffprobe が入力を読めませんでした。中断します"
         rm -rf "$$OUT_DIR"
@@ -399,9 +408,26 @@ configs:
 
       A=$$(ffprobe -v error -select_streams a:0 -analyzeduration 2000000 -probesize 2000000 \
             -show_entries stream=codec_name,sample_rate,channels \
-            -of csv=p=0 "$$SRC" 2>/dev/null)
+            -of default=noprint_wrappers=1 "$$SRC" 2>/dev/null)
 
-      IFS=, read -r VCODEC VPROF VW VH VRATE VPIX <<EOF
+      # key=value (1行1項目) で受け取り、キー名で拾う。位置(何列目か)には
+      # 依存しない。-show_entries に書いた順序どおりに ffprobe が出力する
+      # とは限らず、実際に r_frame_rate と pix_fmt の出力順が入れ替わって
+      # 列がズレることを確認しています。CSVで位置決め打ちすると、こういう
+      # ズレがそのまま誤った値の割り当てになり、しかもエラーにならず
+      # 静かに間違った警告 (今回なら「pix_fmt が 24/1」) を出すだけなので
+      # 気づきにくいです。
+      VCODEC=""; VPROF=""; VW=""; VH=""; VRATE=""; VPIX=""
+      while IFS='=' read -r k v; do
+        case "$$k" in
+          codec_name)   VCODEC="$$v" ;;
+          profile)      VPROF="$$v" ;;
+          width)        VW="$$v" ;;
+          height)       VH="$$v" ;;
+          r_frame_rate) VRATE="$$v" ;;
+          pix_fmt)      VPIX="$$v" ;;
+        esac
+      done <<EOF
       $$V
       EOF
 
@@ -412,13 +438,22 @@ configs:
         FPS=$$(( (RNUM + RDEN / 2) / RDEN ))
       fi
 
+      ACODEC=""; ARATE=""; ACH=""
       if [ -n "$$A" ]; then
-        IFS=, read -r ACODEC ARATE ACH <<EOF
+        while IFS='=' read -r k v; do
+          case "$$k" in
+            codec_name)  ACODEC="$$v" ;;
+            sample_rate) ARATE="$$v" ;;
+            channels)    ACH="$$v" ;;
+          esac
+        done <<EOF
       $$A
       EOF
+      fi
+
+      if [ -n "$$ACODEC" ]; then
         log "input: $${VCODEC} $${VPROF} $${VW}x$${VH} $${FPS}fps $${VPIX} / $${ACODEC} $${ARATE}Hz $${ACH}ch"
       else
-        ACODEC=""
         log "input: $${VCODEC} $${VPROF} $${VW}x$${VH} $${FPS}fps $${VPIX} / 音声なし"
       fi
 
@@ -542,7 +577,7 @@ services:
     configs:
       - source: mediamtx_yml_20260814
         target: /mediamtx.yml
-      - source: on_available_sh_20260814
+      - source: on_available_sh_20260814b
         target: /opt/on_available.sh
     environment:
       # --- 動作モード -------------------------------------------------------
@@ -578,7 +613,7 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814
+      - source: nginx_conf_20260814b
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814
         target: /usr/share/nginx/html/index.html
