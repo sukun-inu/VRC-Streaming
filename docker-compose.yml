@@ -127,19 +127,30 @@ configs:
           error_log  /dev/stderr warn;
 
           # --- 案内ページ: 配信キーを入れると再生URLを組み立てる -------------------
+          #  マウント先は /usr/share/nginx/html (イメージに元から存在する docroot)。
+          #  存在しないディレクトリ (例: /etc/nginx/html) を新規にマウント対象にすると、
+          #  Docker がファイルの代わりにディレクトリを作ってしまうことがあり、
+          #  alias がそのディレクトリを指して nginx が 500 (EISDIR) を返します。
           location = / {
               default_type text/html;
-              alias /etc/nginx/html/index.html;
+              alias /usr/share/nginx/html/index.html;
           }
 
           # --- プレイリスト: 絶対にキャッシュさせない ------------------------------
           #  エッジが数秒前のプレイリストを配ると、その中のセグメントは既に
           #  消えている、という状態になって再生が止まります。
+          #
+          #  s-maxage=0 と stale-if-error=0 が要です。max-age/no-store だけだと、
+          #  「オリジンに一瞬でも到達できなかった時にキャッシュ済みの古い応答を
+          #  返す」(stale-if-error, Cloudflare の Always Online 相当) までは
+          #  防げません。視聴開始直後に古いプレイリストを掴んで即座に取得エラーに
+          #  なる、という症状はこれが原因のことが多いです。
           location ~ \.m3u8$$ {
               types { }
               default_type application/vnd.apple.mpegurl;
-              add_header Cache-Control     "no-store, no-cache, must-revalidate, max-age=0" always;
+              add_header Cache-Control     "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0, stale-while-revalidate=0, stale-if-error=0" always;
               add_header CDN-Cache-Control "no-store" always;
+              add_header Pragma "no-cache" always;
               add_header Access-Control-Allow-Origin "*" always;
               etag off;
           }
@@ -553,7 +564,7 @@ services:
       - source: nginx_conf
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html
-        target: /etc/nginx/html/index.html
+        target: /usr/share/nginx/html/index.html
     logging: *logging
 
 volumes:

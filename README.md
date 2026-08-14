@@ -288,6 +288,39 @@ CPU を 1〜2 コア使うので、判定が済んだら `copy` に戻してく�
 
 **4. `SEG_KEEP_EXTRA` を増やす。** 120 でも 300 でも。遅延は増えません。
 
+### 手順1で「Cloudflare 経路の問題」と分かった場合
+
+**症状が「視聴開始直後だけ取得エラー、LAN直結では出ない」なら、
+このスタックではなく Cloudflare 側の設定が原因である可能性が高いです。**
+このリポジトリのファイルからは cloudflared/Cloudflare の設定を直接
+変更できないので（既存のトンネルをそのまま使う設計のため）、
+Cloudflare ダッシュボードで以下を確認してください。
+
+1. **Caching → Cache Rules / Page Rules。** このホスト名・パスに対して
+   オリジンのキャッシュヘッダを上書きするルールが無いか確認してください。
+   `*.m3u8` は明示的に **Bypass cache** にするのが確実です。
+   nginx 側は `Cache-Control: no-store, s-maxage=0, stale-if-error=0` を
+   既に付けていますが（このリポジトリで対応済み）、固定 TTL の
+   Cache Rule があるとオリジンのヘッダより優先されることがあります。
+2. **Caching → Configuration → Always Online。** 有効だと、オリジンに
+   一瞬でも到達できなかった時にキャッシュ済みの古い応答を返すことが
+   あります。古いプレイリストを掴むと中のセグメントが全部消えている
+   ため、視聴開始直後に即エラーになる症状と一致します。
+3. **Security → Bot Fight Mode / WAF。** VRChat の動画プレイヤーは
+   ブラウザではないので、Bot 判定に引っかかると素の動画の代わりに
+   チャレンジページ（HTML）が返り、プレイヤー側は再生できず
+   エラーになります。このホスト名だけ Bot Fight Mode を切るか、
+   `/*.m3u8` `/*.ts` を対象に WAF の Skip ルールを追加してください。
+4. **Tunnel の種類。** `cloudflared tunnel --url ...` のような
+   使い捨ての Quick Tunnel だと、接続が不安定になりやすいです。
+   ゾーンに紐付いた名前付き Tunnel を使っているか確認してください。
+5. 上記で直らない/切り分けたいときは、`cloudflared` 側のログ
+   （コネクタの再接続・タイムアウトが無いか）と、一時的に nginx の
+   `access_log` を有効にして（`configs.nginx_conf` の `access_log off;`
+   を `access_log /dev/stdout;` に変更）失敗した瞬間に該当リクエストが
+   origin まで届いていたかを突き合わせてください。届いていなければ
+   Cloudflare より手前で止まっている証拠です。
+
 ---
 
 ## 触れる設定
