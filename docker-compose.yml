@@ -376,12 +376,8 @@ services:
       - source: run_sh
         target: /opt/run.sh
     # このイメージの ENTRYPOINT は ffmpeg 本体なので上書きします。
-    # 念のため実行前に CR を落としています。
-    entrypoint:
-      - /bin/sh
-      - -c
-      - 'tr -d "
-" < /opt/run.sh > /tmp/run.sh; exec sh /tmp/run.sh'
+    # シェルに文字列を解釈させず argv をそのまま渡します。
+    entrypoint: ["/bin/sh", "/opt/run.sh"]
     environment:
       # --- 動作モード -------------------------------------------------------
       #  copy      : 再エンコードなし。CPU ほぼ 0・遅延最小。通常はこれ。
