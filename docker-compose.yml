@@ -47,10 +47,26 @@
 #     (どうしても名前を変えたくない場合は `docker compose up -d
 #     --force-recreate` で強制的に作り直せます)
 #
+#  ■ 配信状況ダッシュボード
+#     http://<ホストIP>:8082/ で、今どの配信キーが上がっていて、誰が
+#     (どのIP・逆引きホスト名で) 見ているかをリアルタイムに一覧できます。
+#     自宅LAN内向け (cloudflared のトンネルには乗せていません)。判定方式や
+#     制約は vrc-stats サービス (stats.py 冒頭のコメント) 参照。
+#
+#  ■ 視聴者の実IPについて
+#     cloudflared はこのホストへローカル接続で中継してくるだけなので、
+#     何もしなければ nginx から見えるアクセス元は全員 cloudflared 自身に
+#     なってしまいます。nginx.conf で Cloudflare の CF-Connecting-IP
+#     ヘッダーから実際のアクセス元IPを復元しています。nginx 自身は
+#     リクエストのたびに同期的な逆引き (DNS PTR) はしません — Apache の
+#     HostnameLookups が非推奨とされているのと同じ理由です。逆引き済みで
+#     見たい場合は上のダッシュボードを使ってください。
+#
 #  ■ 注意
 #     network_mode: host なので、旧スタックが :80 や :1935 を掴んだままだと
 #     起動に失敗します。先に落としてください。
-#     RTMP ポート(1935)は自宅LANの外に公開しないでください。
+#     RTMP ポート(1935)、配信状況ダッシュボード(8082)は自宅LANの外に
+#     公開しないでください (cloudflared のトンネルに含めない)。
 # =============================================================================
 
 x-logging: &logging
@@ -59,7 +75,7 @@ x-logging: &logging
 
 configs:
 
-  mediamtx_yml_20260814b:
+  mediamtx_yml_20260814c:
     content: |
       # =============================================================================
       #  MediaMTX — RTMP 受け口 + 配信キーごとの HLS 変換
@@ -84,7 +100,6 @@ configs:
       writeQueueSize: 1024
 
       # 使わないものは全部止める
-      api: no
       metrics: no
       pprof: no
       playback: no
@@ -93,6 +108,14 @@ configs:
       srt: no
       hls: no
       moq: no
+
+      # API だけ例外的に有効。vrc-stats サービスが「今どの配信キーが上がって
+      # いるか」を GET /v3/paths/list で聞きに行くために使います。
+      # apiAddress を 127.0.0.1 に絞っているので、network_mode: host でも
+      # ホスト外には出ません (nginx 側の 127.0.0.1:8081 デバッグ用
+      # エンドポイントと同じ考え方)。
+      api: yes
+      apiAddress: 127.0.0.1:9997
 
       # RTMP のみ。on_available.sh の SRC (rtmp://127.0.0.1:1935/<キー>) と対応。
       rtmp: yes
@@ -122,7 +145,7 @@ configs:
           # このプロセスに SIGINT を送って止めます。
           runOnAvailable: /bin/sh /opt/on_available.sh
 
-  nginx_conf_20260814j:
+  nginx_conf_20260814k:
     content: |
       # =============================================================================
       #  HLS 配信
@@ -144,12 +167,38 @@ configs:
       #  /<キー>/index.m3u8 だけに統一しています。
       # =============================================================================
 
+      # 配信状況ダッシュボード (vrc-stats) へ視聴状況を伝えるための最小フォーマット。
+      # HLSLOG| で始まる行だけを stats 側で拾うので、他のログ行と混ざっても
+      # 誤検出しません。$$remote_addr は下の real_ip 設定 (server ブロック内)
+      # で置き換わった後の値、つまり cloudflared 経由でも視聴者の実IPです。
+      log_format hlslog 'HLSLOG|$$time_iso8601|$$remote_addr|$$uri|$$status';
+
       server {
           listen 80;
           root /hls;
 
-          # 1秒2リクエスト × 視聴者数。障害調査のときだけ on に。
-          access_log off;
+          # cloudflared はこのホストへローカル接続で中継してくるだけなので、
+          # 何もしなければ $$remote_addr は視聴者のIPではなく cloudflared 自身
+          # (127.0.0.1) になってしまいます。Cloudflare はエッジで
+          # CF-Connecting-IP ヘッダーに本来の接続元IPを入れて転送してくる
+          # ので、ループバックからの接続に限ってそれを信用して $$remote_addr を
+          # 復元します (LAN内の他端末がこのヘッダーを偽装しても、ループバック
+          # からの接続でなければ無視されるので効きません)。
+          set_real_ip_from 127.0.0.1;
+          set_real_ip_from ::1;
+          real_ip_header CF-Connecting-IP;
+          real_ip_recursive off;
+
+          # 視聴者数 × 1秒2リクエスト程度のペースでログが出ます。下の
+          # vrc-stats サービスが視聴者一覧を作るのに使うので常時 on に
+          # しています。生ログは docker compose logs nginx でも見られます
+          # (ただし逆引き済みホスト名までは出ません。nginx はリクエストの
+          # たびに同期的にDNS逆引きをするような真似はしません — Apache の
+          # HostnameLookups が非推奨とされているのと同じ理由で、リクエスト
+          # 経路上での同期DNSはパフォーマンス上の実害があるからです。
+          # 逆引き済みで見たいときは配信状況ダッシュボードを使ってください)。
+          access_log /dev/stdout hlslog;
+          access_log syslog:server=127.0.0.1:19514,tag=hls,nohostname hlslog;
           error_log  /dev/stderr warn;
 
           # --- 案内ページ: 配信キーを入れると再生URLを組み立てる -------------------
@@ -660,6 +709,471 @@ configs:
       rm -rf "$$OUT_DIR"
       log "ffmpeg exited"
 
+  stats_py_20260814:
+    content: |
+      #!/usr/bin/env python3
+      # =============================================================================
+      #  配信状況ダッシュボード (vrc-stats)
+      # =============================================================================
+      #  「今どの配信キーが上がっているか」は mediamtx の API (127.0.0.1:9997) に
+      #  聞きに行きます。「誰が見ているか」は mediamtx では分かりません
+      #  (このスタックの HLS は mediamtx ではなく nginx が tmpfs から直接配っている
+      #  ので、mediamtx からは見えない)。そこで nginx 側のアクセスログを syslog
+      #  (UDP, 127.0.0.1:19514) でこのプロセスへ直接送ってもらい、そこから拾います。
+      #  nginx.conf 側の access_log syslog:server=127.0.0.1:19514 と対になっている
+      #  ので、ポート番号を変えるなら両方直してください。19514 という半端な数字は、
+      #  自宅サーバで既に rsyslog 等が使っていがちな 514/1514/5514 のような
+      #  切りの良いポートとの衝突を避けるためです。
+      #
+      #  「視聴中」の判定はタイムアウト方式です。HLS はプレイヤーが定期的に
+      #  プレイリスト/セグメントを取りに来続けるだけで、明示的な「切断」通知が
+      #  無いので、直近 VIEWER_TIMEOUT_SECONDS 秒アクセスが無いIPは
+      #  「見なくなった」とみなして一覧から消します。配信自体が終わると
+      #  on_available.sh がそのキーのHLS出力を即座に消すので、視聴者側は
+      #  すぐ404を踏むようになり (404は「視聴中」に数えません)、この
+      #  タイムアウト時間だけ遅れて一覧から消えます。
+      #
+      #  状態はすべてメモリ上だけに持っていて、どこにも永続化しません。
+      #  このプロセスを再起動すれば一覧は空から再スタートします
+      #  (「配信が生きている間だけ分かればいい」という用途なので、これで十分)。
+      # =============================================================================
+
+      import http.server
+      import json
+      import os
+      import re
+      import socket
+      import sys
+      import threading
+      import time
+      import urllib.error
+      import urllib.request
+      from concurrent.futures import ThreadPoolExecutor
+
+      # alpine (musl) はロケール未設定だと標準出力が ascii にフォールバックすることがあり、
+      # 日本語ログを print() した瞬間に UnicodeEncodeError で落ちます。compose 側の
+      # PYTHONUTF8=1 で通常は防げますが、手動で `python3 stats.py` された場合の保険として
+      # ここでも明示的に UTF-8 化しておきます。
+      for _stream in (sys.stdout, sys.stderr):
+          if hasattr(_stream, "reconfigure"):
+              _stream.reconfigure(encoding="utf-8", errors="replace")
+
+      # --- 設定 --------------------------------------------------------------------
+      HTTP_PORT = int(os.environ.get("STATS_PORT", "8082"))
+      VIEWER_TIMEOUT = int(os.environ.get("VIEWER_TIMEOUT_SECONDS", "8"))
+
+      # 以下2つは compose の他のサービスと直結した内部配線なので環境変数化していません。
+      # 変えるなら nginx.conf / mediamtx.yml 側もあわせて直してください。
+      MEDIAMTX_API = "http://127.0.0.1:9997"
+      SYSLOG_BIND = ("127.0.0.1", 19514)
+
+      POLL_INTERVAL = 2       # mediamtx APIを見に行く間隔 (秒)
+      STREAM_STALE_AFTER = POLL_INTERVAL * 4  # この間 mediamtx 側で観測できなければ配信一覧から消す
+      DNS_OK_TTL = 600         # 逆引き成功時のキャッシュ有効期限 (秒)
+      DNS_NG_TTL = 60          # 逆引き失敗 (PTR無し等) 時のキャッシュ有効期限。短めにして再試行を許す。
+      DNS_WORKERS = 6          # 同時に投げる逆引きの最大本数
+
+      # 配信キーの形式は mediamtx.yml の paths 正規表現と揃えています。
+      KEY_RE = re.compile(r"^/([A-Za-z0-9_-]{6,32})/")
+
+      # --- 共有状態 ------------------------------------------------------------------
+      # 複数スレッド (syslog受信 / mediamtx ポーリング / 掃除 / HTTPハンドラ) から
+      # 触るので、全部このロック1本の下で読み書きします。データ量も更新頻度も
+      # 小さい個人利用規模なので、ロックの粒度を細かくする実益はありません。
+      _lock = threading.Lock()
+      _viewers = {}    # key -> { ip -> {"first_seen": epoch, "last_seen": epoch} }
+      _streams = {}    # key -> {"online_since": str|None, "seen_at": epoch}
+      _dns_cache = {}  # ip -> {"hostname": str|None, "expiry": epoch}
+      _dns_inflight = set()
+      _dns_pool = ThreadPoolExecutor(max_workers=DNS_WORKERS, thread_name_prefix="rdns")
+
+
+      def now():
+          return time.time()
+
+
+      def log(msg):
+          print("[stats] " + msg, flush=True)
+
+
+      # --- 逆引き --------------------------------------------------------------------
+      def resolve_hostname(ip):
+          # socket.gethostbyaddr にはタイムアウトを個別指定できません。OSのリゾルバが
+          # ハングすると、このワーカースレッドはそのぶん長く塞がれますが、結果は
+          # キャッシュ経由で非同期に反映されるだけなので、ダッシュボードのHTTP応答
+          # 自体が遅れることはありません (悪くてもワーカー本数ぶんの解決が滞るだけ)。
+          try:
+              hostname, _aliases, _addrs = socket.gethostbyaddr(ip)
+          except (socket.herror, socket.gaierror, OSError):
+              hostname = None
+          with _lock:
+              ttl = DNS_OK_TTL if hostname else DNS_NG_TTL
+              _dns_cache[ip] = {"hostname": hostname, "expiry": now() + ttl}
+              _dns_inflight.discard(ip)
+
+
+      def ensure_resolving(ip):
+          with _lock:
+              cached = _dns_cache.get(ip)
+              fresh = cached is not None and cached["expiry"] > now()
+              if fresh or ip in _dns_inflight:
+                  return
+              _dns_inflight.add(ip)
+          _dns_pool.submit(resolve_hostname, ip)
+
+
+      # --- nginx からのアクセスログ受信 (syslog UDP) ---------------------------------
+      def syslog_listener():
+          sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          sock.bind(SYSLOG_BIND)
+          log("syslog listener on {}:{}".format(*SYSLOG_BIND))
+          marker = "HLSLOG|"
+          while True:
+              try:
+                  data, _addr = sock.recvfrom(65535)
+              except OSError:
+                  continue
+              line = data.decode("utf-8", "replace")
+              idx = line.find(marker)
+              if idx < 0:
+                  continue
+              fields = line[idx + len(marker):].strip().split("|")
+              if len(fields) != 4:
+                  continue
+              _ts, ip, uri, status = fields
+              if not status.startswith("2"):
+                  continue  # 404等は「視聴中」に数えない
+              m = KEY_RE.match(uri)
+              if not m:
+                  continue
+              key = m.group(1)
+              t = now()
+              with _lock:
+                  viewers = _viewers.setdefault(key, {})
+                  entry = viewers.get(ip)
+                  if entry is None:
+                      viewers[ip] = {"first_seen": t, "last_seen": t}
+                  else:
+                      entry["last_seen"] = t
+              ensure_resolving(ip)
+
+
+      # --- mediamtx から「今上がっている配信」を取得 ---------------------------------
+      def mediamtx_poller():
+          url = MEDIAMTX_API + "/v3/paths/list?itemsPerPage=100"
+          while True:
+              try:
+                  with urllib.request.urlopen(url, timeout=3) as resp:
+                      data = json.load(resp)
+                  t = now()
+                  with _lock:
+                      for item in data.get("items", []):
+                          name = item.get("name")
+                          if not name:
+                              continue
+                          if item.get("online"):
+                              prev = _streams.get(name) or {}
+                              online_since = item.get("onlineTime") or prev.get("online_since")
+                              _streams[name] = {"online_since": online_since, "seen_at": t}
+                          else:
+                              _streams.pop(name, None)
+              except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+                  log("mediamtx API に届きません: {}".format(e))
+              time.sleep(POLL_INTERVAL)
+
+
+      # --- 掃除 (タイムアウトしたものを一覧から落とす) --------------------------------
+      def prune_loop():
+          while True:
+              t = now()
+              with _lock:
+                  for key in list(_viewers.keys()):
+                      viewers = _viewers[key]
+                      for ip in list(viewers.keys()):
+                          if t - viewers[ip]["last_seen"] > VIEWER_TIMEOUT:
+                              del viewers[ip]
+                      if not viewers:
+                          del _viewers[key]
+                  for name in list(_streams.keys()):
+                      if t - _streams[name]["seen_at"] > STREAM_STALE_AFTER:
+                          del _streams[name]
+              time.sleep(1)
+
+
+      def build_state():
+          t = now()
+          with _lock:
+              keys = sorted(set(_streams) | set(_viewers))
+              streams_out = []
+              total_viewers = 0
+              for key in keys:
+                  info = _streams.get(key)
+                  viewers_raw = _viewers.get(key, {})
+                  viewers_out = []
+                  for ip in sorted(viewers_raw):
+                      v = viewers_raw[ip]
+                      cached = _dns_cache.get(ip)
+                      hostname = cached["hostname"] if cached else None
+                      viewers_out.append({
+                          "ip": ip,
+                          "hostname": hostname,
+                          "watching_seconds": int(t - v["first_seen"]),
+                      })
+                  total_viewers += len(viewers_out)
+                  streams_out.append({
+                      "key": key,
+                      "online": info is not None,
+                      "online_since": info["online_since"] if info else None,
+                      "viewer_count": len(viewers_out),
+                      "viewers": viewers_out,
+                  })
+          return {
+              "now": t,
+              "viewer_timeout_seconds": VIEWER_TIMEOUT,
+              "live_count": sum(1 for s in streams_out if s["online"]),
+              "total_viewers": total_viewers,
+              "streams": streams_out,
+          }
+
+
+      # --- ダッシュボード (静的HTML + JS。fetch でポーリングして自前でDOM構築) --------
+      #  逆引きホスト名は他人 (視聴者) が制御できる値です (自分のIPのPTRレコードは
+      #  誰でも設定できる)。innerHTML への文字列結合では絶対に組み込まず、
+      #  textContent / createElement だけで描画しています。
+      DASHBOARD_HTML = """<!doctype html>
+      <html lang="ja">
+      <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>配信状況ダッシュボード</title>
+      <style>
+        :root {
+          color-scheme: light dark;
+          --bg: #0b0d10; --fg: #e8e8ea; --sub: #9aa0a6;
+          --card: #16191d; --accent: #5b8def; --border: #262b31;
+          --live: #3ecf8e; --idle: #e2a33d; --err: #e2554d;
+        }
+        @media (prefers-color-scheme: light) {
+          :root { --bg:#f6f7f9; --fg:#1b1d21; --sub:#5a606a; --card:#fff; --border:#e2e5e9; }
+        }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif;
+          padding: 24px;
+        }
+        header { max-width: 960px; margin: 0 auto 20px; }
+        h1 { font-size: 20px; margin: 0 0 4px; }
+        .sub { color: var(--sub); font-size: 13px; line-height: 1.6; }
+        .summary { display: flex; gap: 18px; margin-top: 12px; flex-wrap: wrap; }
+        .stat { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+                padding: 10px 16px; font-size: 13px; }
+        .stat b { font-size: 18px; display: block; }
+        #conn { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); }
+        #conn.ok { color: var(--live); }
+        #conn.error { color: var(--err); }
+        main { max-width: 960px; margin: 0 auto; display: grid; gap: 14px; }
+        .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+        .card h2 { margin: 0 0 8px; font-size: 15px; display: flex; align-items: center; gap: 10px; }
+        .badge { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; letter-spacing: .04em; }
+        .badge.live { background: rgba(62,207,142,.15); color: var(--live); }
+        .badge.idle { background: rgba(226,163,61,.15); color: var(--idle); }
+        .key { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+        .count { color: var(--sub); font-size: 12px; margin: 0 0 10px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+        th { color: var(--sub); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+        td.ip { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+        td.muted { color: var(--sub); }
+        .empty { color: var(--sub); text-align: center; padding: 40px 0; }
+      </style>
+      </head>
+      <body>
+      <header>
+        <h1>配信状況ダッシュボード</h1>
+        <p class="sub">
+          自宅LAN内向け。1.5秒ごとに自動更新します。視聴者は一定時間 (既定8秒)
+          アクセスが無いと一覧から消えます。逆引きは相手のISP/ルーターの設定次第
+          なので、常に取れるとは限りません。
+        </p>
+        <div class="summary">
+          <div class="stat"><b id="liveCount">-</b>配信中</div>
+          <div class="stat"><b id="viewerCount">-</b>視聴中(合計)</div>
+          <div class="stat"><b id="updated">-</b>最終更新<div><span id="conn">-</span></div></div>
+        </div>
+      </header>
+      <main id="streams"></main>
+      <script>
+      (function () {
+        "use strict";
+
+        function pad(n) { return (n < 10 ? "0" : "") + n; }
+
+        function formatDuration(sec) {
+          sec = Math.max(0, Math.floor(sec));
+          var h = Math.floor(sec / 3600);
+          var m = Math.floor((sec % 3600) / 60);
+          var s = sec % 60;
+          return (h > 0 ? h + ":" : "") + pad(m) + ":" + pad(s);
+        }
+
+        function formatClock(epochSeconds) {
+          var d = new Date(epochSeconds * 1000);
+          return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+        }
+
+        function el(tag, opts) {
+          var node = document.createElement(tag);
+          opts = opts || {};
+          if (opts.className) node.className = opts.className;
+          if (opts.text !== undefined) node.textContent = opts.text;
+          return node;
+        }
+
+        function buildStreamCard(stream) {
+          var card = el("div", { className: "card" });
+
+          var h2 = el("h2");
+          var badge = el("span", {
+            className: "badge " + (stream.online ? "live" : "idle"),
+            text: stream.online ? "LIVE" : "視聴者のみ"
+          });
+          var keySpan = el("span", { className: "key", text: stream.key });
+          h2.appendChild(badge);
+          h2.appendChild(keySpan);
+          card.appendChild(h2);
+
+          card.appendChild(el("p", {
+            className: "count",
+            text: "視聴中: " + stream.viewer_count + " 人"
+          }));
+
+          if (stream.viewers.length > 0) {
+            var table = el("table");
+            // ヘッダーは固定文字列のみで組み立てているので innerHTML でも安全。
+            table.innerHTML = "<thead><tr><th>IP</th><th>逆引き</th><th>視聴時間</th></tr></thead>";
+            var tbody = el("tbody");
+            stream.viewers.forEach(function (v) {
+              var tr = el("tr");
+              tr.appendChild(el("td", { className: "ip", text: v.ip }));
+              tr.appendChild(el("td", {
+                className: v.hostname ? "" : "muted",
+                text: v.hostname || "(解決待ち / 逆引き不可)"
+              }));
+              tr.appendChild(el("td", { text: formatDuration(v.watching_seconds) }));
+              tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            card.appendChild(table);
+          } else {
+            card.appendChild(el("p", { className: "count", text: "視聴者はいません。" }));
+          }
+
+          return card;
+        }
+
+        function render(data) {
+          var root = document.getElementById("streams");
+          root.textContent = "";
+          if (!data.streams || data.streams.length === 0) {
+            root.appendChild(el("p", { className: "empty", text: "現在配信中のストリームはありません。" }));
+          } else {
+            data.streams.forEach(function (s) {
+              root.appendChild(buildStreamCard(s));
+            });
+          }
+          document.getElementById("liveCount").textContent = String(data.live_count);
+          document.getElementById("viewerCount").textContent = String(data.total_viewers);
+          document.getElementById("updated").textContent = formatClock(data.now);
+        }
+
+        function setConnState(ok) {
+          var elConn = document.getElementById("conn");
+          elConn.className = ok ? "ok" : "error";
+          elConn.textContent = ok ? "接続中" : "接続エラー(再試行中)";
+        }
+
+        function refresh() {
+          fetch("/api/state", { cache: "no-store" })
+            .then(function (res) {
+              if (!res.ok) throw new Error("bad status " + res.status);
+              return res.json();
+            })
+            .then(function (data) {
+              render(data);
+              setConnState(true);
+            })
+            .catch(function () {
+              setConnState(false);
+            });
+        }
+
+        refresh();
+        setInterval(refresh, 1500);
+      })();
+      </script>
+      </body>
+      </html>
+      """
+
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          server_version = "vrc-stats/1"
+
+          def log_message(self, fmt, *args):
+              # ダッシュボードから1.5秒おきにポーリングされるので、毎リクエスト
+              # ログすると騒がしいだけです。起動時ログやエラーは log() 側で別途出します。
+              pass
+
+          def _route(self):
+              """(status, content_type, body_bytes, extra_headers) を返すだけで、
+              実際に書き出すのは呼び出し側 (do_GET / do_HEAD)。"""
+              if self.path == "/" or self.path == "/index.html":
+                  return (
+                      200, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"),
+                      {"Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'"}
+                  )
+              if self.path == "/api/state":
+                  body = json.dumps(build_state(), ensure_ascii=False).encode("utf-8")
+                  return 200, "application/json; charset=utf-8", body, {}
+              return 404, "text/plain; charset=utf-8", b"not found\n", {}
+
+          def _send_headers(self, status, content_type, body, extra_headers):
+              self.send_response(status)
+              self.send_header("Content-Type", content_type)
+              self.send_header("Content-Length", str(len(body)))
+              self.send_header("Cache-Control", "no-store")
+              self.send_header("X-Content-Type-Options", "nosniff")
+              for k, v in extra_headers.items():
+                  self.send_header(k, v)
+              self.end_headers()
+
+          def do_GET(self):
+              status, content_type, body, extra_headers = self._route()
+              self._send_headers(status, content_type, body, extra_headers)
+              self.wfile.write(body)
+
+          def do_HEAD(self):
+              # ブラウザは使わないが、curl -I 等での死活確認に応えられるようにしておく。
+              status, content_type, body, extra_headers = self._route()
+              self._send_headers(status, content_type, body, extra_headers)
+
+
+      def main():
+          log("starting: http=0.0.0.0:{} (LAN向け) syslog={}:{} mediamtx_api={} viewer_timeout={}s".format(
+              HTTP_PORT, SYSLOG_BIND[0], SYSLOG_BIND[1], MEDIAMTX_API, VIEWER_TIMEOUT
+          ))
+          threading.Thread(target=syslog_listener, daemon=True).start()
+          threading.Thread(target=mediamtx_poller, daemon=True).start()
+          threading.Thread(target=prune_loop, daemon=True).start()
+
+          server = http.server.ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+          server.serve_forever()
+
+
+      if __name__ == "__main__":
+          main()
+
 services:
 
   # OBS の送り先:  rtmp://<ホストIP>:1935/  ストリームキーは自分で決める
@@ -674,7 +1188,7 @@ services:
     volumes:
       - hls:/hls
     configs:
-      - source: mediamtx_yml_20260814b
+      - source: mediamtx_yml_20260814c
         target: /mediamtx.yml
       - source: on_available_sh_20260814c
         target: /opt/on_available.sh
@@ -724,12 +1238,46 @@ services:
     volumes:
       - hls:/hls:ro
     configs:
-      - source: nginx_conf_20260814j
+      - source: nginx_conf_20260814k
         target: /etc/nginx/conf.d/default.conf
       - source: landing_html_20260814c
         target: /usr/share/nginx/html/index.html
       - source: clock_html_20260814
         target: /usr/share/nginx/html/clock.html
+    logging: *logging
+
+  # 配信状況ダッシュボード。今どの配信キーが上がっていて、誰が (どのIP・
+  # 逆引きホスト名で) 見ているかをリアルタイムに一覧するためだけの小さな
+  # 自作サービスです (Python標準ライブラリのみ、外部パッケージへの依存なし)。
+  #
+  # 「上がっている配信」は上の mediamtx サービスの API (127.0.0.1:9997 に
+  # 限定して有効化) に聞きに行きます。「誰が見ているか」は mediamtx では
+  # 分かりません (このスタックの HLS は mediamtx ではなく nginx が tmpfs
+  # から直接配っているため) — nginx のアクセスログを syslog (UDP,
+  # 127.0.0.1:19514) でこのサービスへ直接送ってもらい、そこから拾って
+  # います。状態はすべてメモリ上だけで、永続化はしません。詳しい設計は
+  # スクリプト本体 (下の stats_py_20260814) 冒頭のコメント参照。
+  #
+  # LAN内向け (0.0.0.0 bind)。cloudflared のトンネルには乗せていません。
+  # イメージは nginx と同じ理由でバージョン固定せず最新の3系に追従します
+  # (標準ライブラリしか使っておらず、3.x内での破壊的変更のリスクが低いため)。
+  stats:
+    image: python:3-alpine
+    pull_policy: always
+    container_name: vrc-stats
+    restart: unless-stopped
+    network_mode: host
+    configs:
+      - source: stats_py_20260814
+        target: /opt/stats.py
+    environment:
+      # alpine (musl) はロケール未設定だと標準出力が ascii にフォールバック
+      # することがあり、日本語ログを print() した瞬間に UnicodeEncodeError
+      # で落ちます。これで標準出力/標準エラーを常に UTF-8 に固定します。
+      PYTHONUTF8: "1"
+      STATS_PORT: "${STATS_PORT:-8082}"
+      VIEWER_TIMEOUT_SECONDS: "${VIEWER_TIMEOUT_SECONDS:-8}"
+    command: ["python3", "/opt/stats.py"]
     logging: *logging
 
 volumes:
