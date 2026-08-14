@@ -1,9 +1,9 @@
 # =============================================================================
 #  VRChat HLS 配信スタック  —  単一ファイル完結版
 # =============================================================================
-#  OBS ─RTMP:1935→ mediamtx ─RTMP─→ transcoder ─HLS→ tmpfs ←─ nginx:80
-#                                                                 ↑
-#                                             既存の cloudflared ─┘
+#  OBS ─RTMP:1935→ mediamtx(+ffmpeg) ─HLS→ tmpfs ←─ nginx:80
+#                                                        ↑
+#                                    既存の cloudflared ─┘
 #
 #  cloudflared はこのスタックに含みません。既存のものをそのまま使います。
 #
@@ -15,6 +15,13 @@
 #     要 Docker Compose 2.23.1 以上 (configs の content 対応)。
 #       docker compose version
 #
+#  ■ 配信キーは「部屋」です
+#     固定のパスはありません。OBS 側でストリームキーを自由に決めます
+#     (半角英数字・ハイフン・アンダースコア、6〜32文字)。同じキーへの
+#     二重 publish は拒否するので、他人に部屋を乗っ取られません。
+#     複数のキーを同時にライブにできます (それぞれ独立した配信として並走)。
+#     詳しくは README の「配信キーについて」を参照してください。
+#
 #  ■ 埋め込みスクリプトを編集するときの注意
 #     content: の中は Compose の変数展開を通ります。シェルのドル記号は
 #     すべて 2 個重ねて書いてください ($$VAR / $$(( )) / $$(date ...))。
@@ -25,6 +32,7 @@
 #  ■ 注意
 #     network_mode: host なので、旧スタックが :80 や :1935 を掴んだままだと
 #     起動に失敗します。先に落としてください。
+#     RTMP ポート(1935)は自宅LANの外に公開しないでください。
 # =============================================================================
 
 x-logging: &logging
@@ -36,9 +44,13 @@ configs:
   mediamtx_yml:
     content: |
       # =============================================================================
-      #  MediaMTX — RTMP 受け口専用
+      #  MediaMTX — RTMP 受け口 + 配信キーごとの HLS 変換
       # =============================================================================
-      #  HLS はこのプロセスでは扱いません。ffmpeg に完全に移譲しています。
+      #  HLS への変換はこのイメージに同梱された ffmpeg を、配信キーが
+      #  available になるたびに runOnAvailable で都度起動しています
+      #  (on_available.sh)。以前あった別コンテナでの ffprobe ポーリングは
+      #  廃止しました。「なぜこの形にしたか」は README 参照。
+      #
       #  MediaMTX は未知のキーがあると起動に失敗するので、確実に存在するキーだけ
       #  書いています。ここに無い項目はすべて既定値です。
       #
@@ -63,17 +75,33 @@ configs:
       srt: no
       hls: no
 
-      # RTMP のみ。transcoder/run.sh の SRC と対応。
+      # RTMP のみ。on_available.sh の SRC (rtmp://127.0.0.1:1935/<キー>) と対応。
       rtmp: yes
       rtmpAddress: :1935
       rtmpEncryption: "no"
 
       paths:
-        origin:
+        # 配信キーは OBS 側で自由に決められます。固定のパスはありません。
+        # 許可するのは半角英数字・ハイフン・アンダースコアのみ、6〜32文字。
+        # これに一致しない配信キーは MediaMTX がそもそも受け付けません。
+        # runOnAvailable にすら渡らないので、パスの組み立てに危険な文字が
+        # 混ざる心配がありません (on_available.sh 側でも念のため再検査します)。
+        #
+        # 外部公開する可能性があるなら、長く推測されにくいキーにしてください
+        # (この文字種・桁数のままだと総当たりに強いとは言えません)。
+        '~^[A-Za-z0-9_-]{6,32}$':
           source: publisher
-          # OBS が落ちて再接続してきたとき、古いセッションを上書きさせます。
-          # no にすると「まだ生きている扱いの旧セッション」に阻まれて再接続できません。
-          overridePublisher: yes
+
+          # 同じキーへの二重 publish を拒否します。「部屋」を他人に
+          # 割り込まれないための設定なので yes にはしません。
+          # 副作用: 本人の OBS が瞬断して再接続する場合も、readTimeout(10s) が
+          # 経過して旧セッションが死んだと判定されるまで再接続できません。
+          overridePublisher: no
+
+          # このキーが有効になるたびに、このキー専用の ffmpeg 変換を1本
+          # 起動します。配信が終わる (unavailable になる) と MediaMTX が
+          # このプロセスに SIGINT を送って止めます。
+          runOnAvailable: /bin/sh /opt/on_available.sh
 
   nginx_conf:
     content: |
@@ -85,6 +113,9 @@ configs:
       #
       #  キャッシュ制御をここで完結させています。Cloudflare 側のキャッシュルールが
       #  未設定でも壊れません (入れても二重に効くだけで害はありません)。
+      #
+      #  URL は配信キーごとに /<キー>/index.m3u8 です。固定パスの /live/ は
+      #  もうありません。ルート(/) はキーから再生URLを組み立てる案内ページです。
       # =============================================================================
 
       server {
@@ -94,6 +125,12 @@ configs:
           # 1秒2リクエスト × 視聴者数。障害調査のときだけ on に。
           access_log off;
           error_log  /dev/stderr warn;
+
+          # --- 案内ページ: 配信キーを入れると再生URLを組み立てる -------------------
+          location = / {
+              default_type text/html;
+              alias /etc/nginx/html/index.html;
+          }
 
           # --- プレイリスト: 絶対にキャッシュさせない ------------------------------
           #  エッジが数秒前のプレイリストを配ると、その中のセグメントは既に
@@ -124,8 +161,10 @@ configs:
       # =============================================================================
       #  猶予セグメントが溜まっているかを目視するためだけの口。
       #  ホスト内からのみ到達可能で、トンネルには載っていません。
-      #    curl -s http://127.0.0.1:8081/live/ | grep -c '\.ts'
+      #    curl -s http://127.0.0.1:8081/<キー>/ | grep -c '\.ts'
       #  プレイリストには載らないセグメントなので、m3u8 を見ても分かりません。
+      #  autoindex が有効なので、curl -s http://127.0.0.1:8081/ で今ライブ中の
+      #  キー名が一覧できます。ローカルからしか届かないので許容しています。
       # =============================================================================
       server {
           listen 127.0.0.1:8081;
@@ -134,250 +173,349 @@ configs:
           access_log off;
       }
 
-  run_sh:
+  landing_html:
+    content: |
+      <!doctype html>
+      <html lang="ja">
+      <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>配信ルーム</title>
+      <style>
+        :root {
+          color-scheme: light dark;
+          --bg: #0b0d10; --fg: #e8e8ea; --sub: #9aa0a6;
+          --card: #16191d; --accent: #5b8def; --border: #262b31; --warn: #e2a33d;
+        }
+        @media (prefers-color-scheme: light) {
+          :root { --bg:#f6f7f9; --fg:#1b1d21; --sub:#5a606a; --card:#fff; --border:#e2e5e9; --warn:#8a5a00; }
+        }
+        * { box-sizing: border-box; }
+        body {
+          margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+          background: var(--bg); color: var(--fg);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif;
+          padding: 24px;
+        }
+        .card {
+          width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--border);
+          border-radius: 16px; padding: 28px;
+        }
+        h1 { font-size: 18px; margin: 0 0 6px; }
+        p.desc { color: var(--sub); font-size: 13px; margin: 0 0 20px; line-height: 1.6; }
+        label { display:block; font-size: 12px; color: var(--sub); margin-bottom: 6px; }
+        input {
+          width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border);
+          background: transparent; color: var(--fg); font-size: 15px; font-family: ui-monospace, monospace;
+        }
+        input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+        button {
+          margin-top: 14px; width: 100%; padding: 12px; border-radius: 10px; border: none;
+          background: var(--accent); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+        }
+        button:active { opacity: .85; }
+        .format-hint { margin-top: 8px; font-size: 11px; color: var(--sub); }
+        .warn { margin-top: 8px; font-size: 12px; color: var(--warn); display: none; }
+        .warn.show { display: block; }
+        .result { margin-top: 18px; display: none; }
+        .result.show { display: block; }
+        .url-box {
+          display:flex; gap:8px; align-items:center; background: var(--bg); border: 1px solid var(--border);
+          border-radius: 10px; padding: 10px 12px;
+        }
+        .url-box code { flex:1; font-size: 12px; word-break: break-all; }
+        .url-box button { margin:0; width:auto; padding:8px 12px; font-size:12px; background: var(--border); color: var(--fg); }
+        .hint { margin-top:10px; font-size:12px; color: var(--sub); line-height:1.6; }
+      </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>配信ルーム</h1>
+          <p class="desc">配信キーを入力すると、VRChat の動画URL欄に貼り付ける再生URLを作成します。</p>
+          <label for="key">配信キー</label>
+          <input id="key" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="例: my-room-key">
+          <p class="format-hint">半角英数字・ハイフン・アンダースコア、6〜32文字</p>
+          <p class="warn" id="warn">この形式では配信キーとして受け付けられません（サーバ側の設定と一致していません）。</p>
+          <button id="go">URLを作成</button>
+          <div class="result" id="result">
+            <div class="url-box">
+              <code id="url"></code>
+              <button id="copy">コピー</button>
+            </div>
+            <p class="hint">VRChat のワールドの動画URL欄にこのURLを貼り付けてください。配信中でない場合は再生できません。</p>
+          </div>
+        </div>
+      <script>
+      (function () {
+        var input = document.getElementById('key');
+        var go = document.getElementById('go');
+        var warnEl = document.getElementById('warn');
+        var result = document.getElementById('result');
+        var urlEl = document.getElementById('url');
+        var copyBtn = document.getElementById('copy');
+        var KEY_RE = /^[A-Za-z0-9_-]{6,32}$/;
+
+        function build() {
+          var key = input.value.trim();
+          if (!key) { input.focus(); return; }
+          warnEl.className = KEY_RE.test(key) ? 'warn' : 'warn show';
+          var url = location.origin + '/' + encodeURIComponent(key) + '/index.m3u8';
+          urlEl.textContent = url;
+          result.className = 'result show';
+          copyBtn.textContent = 'コピー';
+        }
+
+        go.addEventListener('click', build);
+        input.addEventListener('keydown', function (e) { if (e.key === 'Enter') build(); });
+
+        copyBtn.addEventListener('click', function () {
+          var text = urlEl.textContent;
+          if (!text) return;
+          var done = function () { copyBtn.textContent = 'コピーしました'; setTimeout(function () { copyBtn.textContent = 'コピー'; }, 1500); };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text, done); });
+          } else {
+            fallbackCopy(text, done);
+          }
+        });
+
+        function fallbackCopy(text, done) {
+          var ta = document.createElement('textarea');
+          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta); ta.focus(); ta.select();
+          try { document.execCommand('copy'); } catch (e) {}
+          document.body.removeChild(ta);
+          done();
+        }
+      })();
+      </script>
+      </body>
+      </html>
+
+  on_available_sh:
     content: |
       #!/bin/sh
       # =============================================================================
-      #  RTMP -> HLS  変換ループ
+      #  1配信キー分の RTMP -> HLS 変換
       # =============================================================================
-      #  publisher(OBS) が来るまで待ち、来たら変換し、切れたらまた待つ。
-      #  この3状態しかありません。どこで死んでも待機状態に戻ります。
+      #  MediaMTX の runOnAvailable から、配信キーごとに毎回このスクリプトが
+      #  1本ずつ起動されます。呼ばれた時点で publisher は既に存在するので、
+      #  「待つ」処理はここにはありません (それは MediaMTX 側の仕事です)。
+      #
+      #  配信が終わる (unavailable になる) と MediaMTX がこのプロセスに SIGINT を
+      #  送ってきます。ffmpeg が自分で落ちた場合も含め、どちらの終わり方でも
+      #  trap で後片付けして終了します。「待機に戻ってループ」はしません。
+      #  次にこのキーで配信が始まれば、MediaMTX がまた新しくこのスクリプトを
+      #  起動します。
       #
       #  外部コマンドは ffmpeg / ffprobe / find / grep / date のみ。計算はすべて
       #  シェルの整数演算で済ませてあり awk にも依存しません。
-      #  ベースイメージを差し替えても壊れにくくするためです。
       # =============================================================================
       set -u
 
-      # --- 配線 (compose の environment ではなくここ。運用中に変えるものではない) ---
-      SRC="rtmp://127.0.0.1:1935/origin"   # mediamtx.yml の rtmpAddress と paths に対応
-      OUT_DIR="/hls/live"                  # nginx/hls.conf の root + /live に対応
+      # --- 配線 ---------------------------------------------------------------
+      KEY="$${MTX_PATH:-}"
 
-      # --- 運用ノブ (compose の environment から渡る) ------------------------------
+      # 多重防御。mediamtx.yml の path 正規表現で既に絞ってあるが、
+      # OUT_DIR の組み立てに使う値なので、ここでも念のため検査する。
+      case "$$KEY" in
+        '') echo "FATAL: MTX_PATH が空です" >&2; exit 1 ;;
+        *[!A-Za-z0-9_-]*) echo "FATAL: MTX_PATH に不正な文字: $$KEY" >&2; exit 1 ;;
+      esac
+
+      SRC="rtmp://127.0.0.1:1935/$${KEY}"
+      OUT_DIR="/hls/$${KEY}"
+      PLAYLIST="$${OUT_DIR}/index.m3u8"
+
+      # --- 運用ノブ (compose の environment から渡る。mediamtx サービス側) ------
       MODE="$${MODE:-copy}"
       SEG="$${SEG_SECONDS:-1}"
       LIST="$${SEG_LIST_SIZE:-8}"
       KEEP="$${SEG_KEEP_EXTRA:-60}"
       GOP_CHECK="$${GOP_CHECK_SECONDS:-4}"
 
-      PLAYLIST="$${OUT_DIR}/index.m3u8"
       FFPID=""
 
-      log()  { echo "[$$(date -u '+%H:%M:%S')] $$*"; }
-      warn() { echo "[$$(date -u '+%H:%M:%S')] !! $$*"; }
+      log()  { echo "[$$(date -u '+%H:%M:%S')] [$${KEY}] $$*"; }
+      warn() { echo "[$$(date -u '+%H:%M:%S')] [$${KEY}] !! $$*"; }
 
       # 数値かどうか。これを通さずに $$(( )) へ渡すと、想定外の入力でシェルごと落ちます。
       is_num() { case "$${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
       for c in ffmpeg ffprobe; do
-        command -v "$$c" >/dev/null || { echo "FATAL: $${c} が見つかりません"; exit 1; }
+        command -v "$$c" >/dev/null || { echo "FATAL: $${c} が見つかりません" >&2; exit 1; }
       done
 
+      # 前回このキーで異常終了した残骸があれば消してから作り直す。
+      rm -rf "$$OUT_DIR" 2>/dev/null
       mkdir -p "$$OUT_DIR"
 
-      # ffmpeg はバックグラウンドで動かして wait で待ちます。前面で動かすと停止シグナルを
-      # 受けてもこの trap が ffmpeg の終了まで走らず、停止に10秒待たされます。
-      trap '[ -n "$$FFPID" ] && kill "$$FFPID" 2>/dev/null; rm -f "$$PLAYLIST"; exit 0' TERM INT
+      # MediaMTX から SIGINT/TERM が来たら、ffmpeg を止めて出力ごと消して終わる。
+      trap '[ -n "$$FFPID" ] && kill "$$FFPID" 2>/dev/null; [ -n "$$FFPID" ] && wait "$$FFPID" 2>/dev/null; rm -rf "$$OUT_DIR"; exit 0' TERM INT
 
-      log "mode=$${MODE} segment=$${SEG}s window=$$(( SEG * LIST ))s grace=$$(( SEG * KEEP ))s latency~$$(( SEG * 3 + 2 ))s"
+      log "publisher available mode=$${MODE} segment=$${SEG}s window=$$(( SEG * LIST ))s grace=$$(( SEG * KEEP ))s latency~$$(( SEG * 3 + 2 ))s"
 
-      while :; do
+      # ---------------------------------------------------------------------------
+      # 1) 入力の検査
+      #    copy は OBS の出力をそのまま流すので、ここで見ておかないと
+      #    「サーバは正常なのに VRChat だけ再生できない」になります。
+      # ---------------------------------------------------------------------------
+      V=$$(ffprobe -v error -select_streams v:0 -analyzeduration 2000000 -probesize 2000000 \
+            -show_entries stream=codec_name,profile,width,height,r_frame_rate,pix_fmt \
+            -of csv=p=0 "$$SRC" 2>/dev/null)
+      if [ -z "$$V" ]; then
+        warn "ffprobe が入力を読めませんでした。中断します"
+        rm -rf "$$OUT_DIR"
+        exit 1
+      fi
 
-        # ---------------------------------------------------------------------------
-        # 1) publisher を待つ
-        #    MediaMTX は publisher 不在のパスへの play を即座に拒否するので、
-        #    ffprobe は待たされずすぐ失敗して返ってきます。
-        #
-        #    ここで ffprobe を使えるのが MediaMTX を挟んでいる理由です。
-        #    ffmpeg の -listen 1 で直接 RTMP を受けると接続が1本しか張れず、
-        #    検査と配信を同時にできません。
-        # ---------------------------------------------------------------------------
-        V=$$(ffprobe -v error -select_streams v:0 -analyzeduration 2000000 -probesize 2000000 \
-              -show_entries stream=codec_name,profile,width,height,r_frame_rate,pix_fmt \
-              -of csv=p=0 "$$SRC" 2>/dev/null)
-        [ -n "$$V" ] || { sleep 3; continue; }
+      A=$$(ffprobe -v error -select_streams a:0 -analyzeduration 2000000 -probesize 2000000 \
+            -show_entries stream=codec_name,sample_rate,channels \
+            -of csv=p=0 "$$SRC" 2>/dev/null)
 
-        A=$$(ffprobe -v error -select_streams a:0 -analyzeduration 2000000 -probesize 2000000 \
-              -show_entries stream=codec_name,sample_rate,channels \
-              -of csv=p=0 "$$SRC" 2>/dev/null)
-
-        RUN="$$(date -u +%Y%m%d%H%M%S)"
-        log "--- publisher detected (run=$${RUN}) ---"
-
-        # ---------------------------------------------------------------------------
-        # 2) 入力の検査
-        #    copy は OBS の出力をそのまま流すので、ここで見ておかないと
-        #    「サーバは正常なのに VRChat だけ再生できない」になります。
-        # ---------------------------------------------------------------------------
-        IFS=, read -r VCODEC VPROF VW VH VRATE VPIX <<EOF
+      IFS=, read -r VCODEC VPROF VW VH VRATE VPIX <<EOF
       $$V
       EOF
 
-        # r_frame_rate は "30/1" や "30000/1001" の形。四捨五入して整数 fps にする。
-        FPS=0
-        RNUM="$${VRATE%%/*}"; RDEN="$${VRATE##*/}"
-        if is_num "$$RNUM" && is_num "$$RDEN" && [ "$$RDEN" -gt 0 ]; then
-          FPS=$$(( (RNUM + RDEN / 2) / RDEN ))
-        fi
+      # r_frame_rate は "30/1" や "30000/1001" の形。四捨五入して整数 fps にする。
+      FPS=0
+      RNUM="$${VRATE%%/*}"; RDEN="$${VRATE##*/}"
+      if is_num "$$RNUM" && is_num "$$RDEN" && [ "$$RDEN" -gt 0 ]; then
+        FPS=$$(( (RNUM + RDEN / 2) / RDEN ))
+      fi
 
-        if [ -n "$$A" ]; then
-          IFS=, read -r ACODEC ARATE ACH <<EOF
+      if [ -n "$$A" ]; then
+        IFS=, read -r ACODEC ARATE ACH <<EOF
       $$A
       EOF
-          log "input: $${VCODEC} $${VPROF} $${VW}x$${VH} $${FPS}fps $${VPIX} / $${ACODEC} $${ARATE}Hz $${ACH}ch"
-        else
-          ACODEC=""
-          log "input: $${VCODEC} $${VPROF} $${VW}x$${VH} $${FPS}fps $${VPIX} / 音声なし"
-        fi
+        log "input: $${VCODEC} $${VPROF} $${VW}x$${VH} $${FPS}fps $${VPIX} / $${ACODEC} $${ARATE}Hz $${ACH}ch"
+      else
+        ACODEC=""
+        log "input: $${VCODEC} $${VPROF} $${VW}x$${VH} $${FPS}fps $${VPIX} / 音声なし"
+      fi
 
-        if [ "$$MODE" = "copy" ]; then
-          if [ "$$VCODEC" = "h264" ]; then
-            case "$$VPROF" in
-              Baseline|"Constrained Baseline"|Main|High) ;;
-              *) warn "H.264 プロファイル $${VPROF} は Quest で再生できない可能性が高い" ;;
-            esac
-          else
-            warn "映像が $${VCODEC}。VRChat は H.264 のみ。OBS を直すか MODE=transcode に"
+      if [ "$$MODE" = "copy" ]; then
+        if [ "$$VCODEC" = "h264" ]; then
+          case "$$VPROF" in
+            Baseline|"Constrained Baseline"|Main|High) ;;
+            *) warn "H.264 プロファイル $${VPROF} は Quest で再生できない可能性が高い" ;;
+          esac
+        else
+          warn "映像が $${VCODEC}。VRChat は H.264 のみ。OBS を直すか MODE=transcode に"
+        fi
+        [ "$$VPIX" = "yuv420p" ] || warn "pix_fmt が $${VPIX}。Quest は yuv420p しか再生できません"
+        [ -n "$$ACODEC" ] && [ "$$ACODEC" != "aac" ] && warn "音声が $${ACODEC}。VRChat は AAC のみ"
+        is_num "$$VW" && [ "$$VW" -gt 1920 ] && warn "横 $${VW}px。Quest 向けには 1920 以下を推奨"
+        is_num "$$VH" && [ "$$VH" -gt 1080 ] && warn "縦 $${VH}px。Quest 向けには 1080 以下を推奨"
+        is_num "$$VH" && [ "$$FPS" -gt 30 ] && [ "$$VH" -gt 720 ] &&
+          warn "$${VW}x$${VH}@$${FPS} は Quest だと描画とデコーダが競合しやすい"
+      fi
+
+      # ---------------------------------------------------------------------------
+      # 2) キーフレーム間隔の実測 (copy 運用での最重要項目)
+      #    OBS のキーフレーム間隔が SEG_SECONDS と違うと、ffmpeg は指定どおりに
+      #    切れず OBS 側の間隔で切ります。遅延がそのぶん伸びます。
+      #    「なぜか遅延が想定の倍」はほぼこれです。
+      #
+      #    小数を扱わずに済むよう、すべて 1/10 秒単位の整数で計算しています。
+      # ---------------------------------------------------------------------------
+      if is_num "$$GOP_CHECK" && [ "$$GOP_CHECK" -gt 0 ]; then
+        KF=$$(ffprobe -v error -select_streams v:0 -read_intervals "%+$${GOP_CHECK}" \
+               -show_entries frame=key_frame -of csv=p=0 "$$SRC" 2>/dev/null | grep -c '^1')
+        if is_num "$$KF" && [ "$$KF" -gt 0 ]; then
+          EST10=$$(( GOP_CHECK * 10 / KF ))          # 例: 4秒に2枚 -> 20 (=2.0秒)
+          log "keyframe interval: 約 $$(( EST10 / 10 )).$$(( EST10 % 10 ))s"
+          # 許容 ±30%。EST10 は10倍値なので閾値も10倍で比較する。
+          if [ "$$EST10" -gt $$(( SEG * 13 )) ] || [ "$$EST10" -lt $$(( SEG * 7 )) ]; then
+            warn "キーフレーム間隔が SEG_SECONDS=$${SEG}s と一致していません"
+            warn "  OBS の「キーフレーム間隔」を $${SEG} 秒にしてください"
+            warn "  このままだと遅延が約 $$(( EST10 * 3 / 10 + 2 ))s になります"
           fi
-          [ "$$VPIX" = "yuv420p" ] || warn "pix_fmt が $${VPIX}。Quest は yuv420p しか再生できません"
-          [ -n "$$ACODEC" ] && [ "$$ACODEC" != "aac" ] && warn "音声が $${ACODEC}。VRChat は AAC のみ"
-          is_num "$$VW" && [ "$$VW" -gt 1920 ] && warn "横 $${VW}px。Quest 向けには 1920 以下を推奨"
-          is_num "$$VH" && [ "$$VH" -gt 1080 ] && warn "縦 $${VH}px。Quest 向けには 1080 以下を推奨"
-          is_num "$$VH" && [ "$$FPS" -gt 30 ] && [ "$$VH" -gt 720 ] &&
-            warn "$${VW}x$${VH}@$${FPS} は Quest だと描画とデコーダが競合しやすい"
         fi
+      fi
 
-        # ---------------------------------------------------------------------------
-        # 3) キーフレーム間隔の実測 (copy 運用での最重要項目)
-        #    OBS のキーフレーム間隔が SEG_SECONDS と違うと、ffmpeg は指定どおりに
-        #    切れず OBS 側の間隔で切ります。遅延がそのぶん伸びます。
-        #    「なぜか遅延が想定の倍」はほぼこれです。
-        #
-        #    小数を扱わずに済むよう、すべて 1/10 秒単位の整数で計算しています。
-        # ---------------------------------------------------------------------------
-        if is_num "$$GOP_CHECK" && [ "$$GOP_CHECK" -gt 0 ]; then
-          KF=$$(ffprobe -v error -select_streams v:0 -read_intervals "%+$${GOP_CHECK}" \
-                 -show_entries frame=key_frame -of csv=p=0 "$$SRC" 2>/dev/null | grep -c '^1')
-          if is_num "$$KF" && [ "$$KF" -gt 0 ]; then
-            EST10=$$(( GOP_CHECK * 10 / KF ))          # 例: 4秒に2枚 -> 20 (=2.0秒)
-            log "keyframe interval: 約 $$(( EST10 / 10 )).$$(( EST10 % 10 ))s"
-            # 許容 ±30%。EST10 は10倍値なので閾値も10倍で比較する。
-            if [ "$$EST10" -gt $$(( SEG * 13 )) ] || [ "$$EST10" -lt $$(( SEG * 7 )) ]; then
-              warn "キーフレーム間隔が SEG_SECONDS=$${SEG}s と一致していません"
-              warn "  OBS の「キーフレーム間隔」を $${SEG} 秒にしてください"
-              warn "  このままだと遅延が約 $$(( EST10 * 3 / 10 + 2 ))s になります"
-            fi
-          fi
-        fi
+      # ---------------------------------------------------------------------------
+      # 3) コーデック指定
+      # ---------------------------------------------------------------------------
+      if [ "$$MODE" = "copy" ]; then
+        VOPT="-c:v copy"
+        AENC="-c:a copy"
+      else
+        # 切り分け用の固定プロファイル。ここは環境変数で変えられません。
+        # 「既知の正常値」であることが唯一の存在価値なので、可変にすると
+        # 切り分けの道具として機能しなくなります。
+        VOPT="-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2
+              -c:v libx264 -preset veryfast -profile:v main -level:v 4.0 -pix_fmt yuv420p
+              -b:v 3500k -maxrate 3500k -bufsize 7000k
+              -r 30 -g $$(( 30 * SEG )) -keyint_min $$(( 30 * SEG )) -sc_threshold 0 -bf 0"
+        AENC="-c:a aac -b:a 128k -ar 48000 -ac 2"
+      fi
 
-        # ---------------------------------------------------------------------------
-        # 4) 前回の残骸を掃除
-        #    セグメント名に RUN が入るので、消しても CDN 上のキャッシュ済み URL と
-        #    名前が衝突しません。固定名を使い回すと Cloudflare が前回配信の中身を
-        #    返してしまいます。
-        # ---------------------------------------------------------------------------
-        rm -f "$$PLAYLIST"
-        find "$$OUT_DIR" -maxdepth 1 -type f -name '*.ts' -delete 2>/dev/null
+      # 音声トラックが無い入力にも無音 AAC を必ず載せます。
+      # 音声なしの HLS は AVPro が読み込みに失敗することがあります。
+      if [ -n "$$ACODEC" ]; then
+        SILENCE=""
+        MAPS="-map 0:v:0 -map 0:a:0"
+        AOPT="$$AENC"
+      else
+        SILENCE="-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000"
+        MAPS="-map 0:v:0 -map 1:a:0"
+        AOPT="-c:a aac -b:a 128k -ar 48000 -ac 2 -shortest"
+      fi
 
-        # ---------------------------------------------------------------------------
-        # 5) コーデック指定
-        # ---------------------------------------------------------------------------
-        if [ "$$MODE" = "copy" ]; then
-          VOPT="-c:v copy"
-          AENC="-c:a copy"
-        else
-          # 切り分け用の固定プロファイル。ここは環境変数で変えられません。
-          # 「既知の正常値」であることが唯一の存在価値なので、可変にすると
-          # 切り分けの道具として機能しなくなります。
-          VOPT="-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2
-                -c:v libx264 -preset veryfast -profile:v main -level:v 4.0 -pix_fmt yuv420p
-                -b:v 3500k -maxrate 3500k -bufsize 7000k
-                -r 30 -g $$(( 30 * SEG )) -keyint_min $$(( 30 * SEG )) -sc_threshold 0 -bf 0"
-          AENC="-c:a aac -b:a 128k -ar 48000 -ac 2"
-        fi
+      # ---------------------------------------------------------------------------
+      # 4) HLS 出力
+      #
+      #   hls_delete_threshold がこのスタックの要です。
+      #   プレイリストから外した後もディスクに残す本数で、既定は 1。
+      #   ここに残ったセグメントはプレイリストに現れないので遅延に影響せず、
+      #   取得が遅れたクライアントが 404 を踏まなくなるだけです。
+      #
+      #   temp_file : .tmp に書いてから rename。書きかけを nginx が配る事故を防ぐ。
+      #   master playlist は作りません (単一レンディションなので不要)。
+      # ---------------------------------------------------------------------------
+      RUN="$$(date -u +%Y%m%d%H%M%S)"
+      log "starting ffmpeg (run=$${RUN})"
 
-        # 音声トラックが無い入力にも無音 AAC を必ず載せます。
-        # 音声なしの HLS は AVPro が読み込みに失敗することがあります。
-        if [ -n "$$ACODEC" ]; then
-          SILENCE=""
-          MAPS="-map 0:v:0 -map 0:a:0"
-          AOPT="$$AENC"
-        else
-          SILENCE="-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000"
-          MAPS="-map 0:v:0 -map 1:a:0"
-          AOPT="-c:a aac -b:a 128k -ar 48000 -ac 2 -shortest"
-        fi
+      # shellcheck disable=SC2086
+      ffmpeg -hide_banner -loglevel warning -nostdin \
+        -fflags nobuffer -analyzeduration 2000000 -probesize 2000000 \
+        -i "$$SRC" $$SILENCE \
+        $$MAPS $$VOPT $$AOPT \
+        -f hls \
+        -hls_time "$$SEG" \
+        -hls_list_size "$$LIST" \
+        -hls_delete_threshold "$$KEEP" \
+        -hls_flags delete_segments+omit_endlist+temp_file \
+        -hls_segment_type mpegts \
+        -hls_segment_filename "$${OUT_DIR}/$${RUN}_%06d.ts" \
+        "$$PLAYLIST" &
 
-        # ---------------------------------------------------------------------------
-        # 6) HLS 出力
-        #
-        #   hls_delete_threshold がこのスタックの要です。
-        #   プレイリストから外した後もディスクに残す本数で、既定は 1。
-        #   ここに残ったセグメントはプレイリストに現れないので遅延に影響せず、
-        #   取得が遅れたクライアントが 404 を踏まなくなるだけです。
-        #   MediaMTX の HLS マキサーにはこの概念がありません。
-        #
-        #   temp_file : .tmp に書いてから rename。書きかけを nginx が配る事故を防ぐ。
-        #   master playlist は作りません (単一レンディションなので不要)。
-        # ---------------------------------------------------------------------------
-        log "starting ffmpeg"
+      FFPID=$$!
+      wait "$$FFPID"
+      FFPID=""
 
-        # shellcheck disable=SC2086
-        ffmpeg -hide_banner -loglevel warning -nostdin \
-          -fflags nobuffer -analyzeduration 2000000 -probesize 2000000 \
-          -i "$$SRC" $$SILENCE \
-          $$MAPS $$VOPT $$AOPT \
-          -f hls \
-          -hls_time "$$SEG" \
-          -hls_list_size "$$LIST" \
-          -hls_delete_threshold "$$KEEP" \
-          -hls_flags delete_segments+omit_endlist+temp_file \
-          -hls_segment_type mpegts \
-          -hls_segment_filename "$${OUT_DIR}/$${RUN}_%06d.ts" \
-          "$$PLAYLIST" &
-
-        FFPID=$$!
-        wait "$$FFPID"
-        FFPID=""
-
-        # プレイリストを消します。残すと「配信中に見えるのに全セグメント404」という
-        # 一番わかりにくい状態になります。
-        rm -f "$$PLAYLIST"
-        log "ffmpeg exited — 待機に戻ります"
-        sleep 2
-      done
+      rm -rf "$$OUT_DIR"
+      log "ffmpeg exited"
 
 services:
 
-  # OBS の送り先:  rtmp://<ホストIP>:1935/  ストリームキー origin
+  # OBS の送り先:  rtmp://<ホストIP>:1935/  ストリームキーは自分で決める
+  # (半角英数字・ハイフン・アンダースコア、6〜32文字)。
+  # RTMP 受け口と、配信キーごとの HLS 変換をこのコンテナ1つでやります。
   mediamtx:
-    image: bluenviron/mediamtx:1.20.0
+    image: bluenviron/mediamtx:1.20.0-ffmpeg
     container_name: vrc-mediamtx
-    restart: unless-stopped
-    network_mode: host
-    configs:
-      - source: mediamtx_yml
-        target: /mediamtx.yml
-    logging: *logging
-
-  # RTMP を読んで HLS を書く。このスタックの心臓部。
-  #
-  #  ビルドはしません。Portainer が Docker socket proxy 越しに繋いでいる構成だと
-  #  BuildKit の gRPC セッションがプロキシを通れず、デプロイごと失敗します。
-  transcoder:
-    image: jrottenberg/ffmpeg:8.1.2-ubuntu2404
-    container_name: vrc-transcoder
     restart: unless-stopped
     network_mode: host
     init: true          # PID 1 を docker-init に。ゾンビ回収と signal 転送のため
     volumes:
       - hls:/hls
     configs:
-      - source: run_sh
-        target: /opt/run.sh
-    # このイメージの ENTRYPOINT は ffmpeg 本体なので上書きします。
-    # シェルに文字列を解釈させず argv をそのまま渡します。
-    entrypoint: ["/bin/sh", "/opt/run.sh"]
+      - source: mediamtx_yml
+        target: /mediamtx.yml
+      - source: on_available_sh
+        target: /opt/on_available.sh
     environment:
       # --- 動作モード -------------------------------------------------------
       #  copy      : 再エンコードなし。CPU ほぼ 0・遅延最小。通常はこれ。
@@ -398,12 +536,12 @@ services:
       SEG_KEEP_EXTRA: "${SEG_KEEP_EXTRA:-60}"
 
       # --- 入力検査 ---------------------------------------------------------
-      #  配信開始時にキーフレーム間隔を実測します。この秒数ぶん開始が遅れます。
+      #  配信開始のたびにキーフレーム間隔を実測します。この秒数ぶん開始が遅れます。
       #  0 で無効。設定が固まるまでは有効のままを推奨。
       GOP_CHECK_SECONDS: "${GOP_CHECK_SECONDS:-4}"
     logging: *logging
 
-  # HLS 配信。キャッシュ制御もここで完結。
+  # HLS 配信。キャッシュ制御と案内ページもここで完結。
   nginx:
     image: nginx:1.27-alpine
     container_name: vrc-nginx
@@ -414,11 +552,16 @@ services:
     configs:
       - source: nginx_conf
         target: /etc/nginx/conf.d/default.conf
+      - source: landing_html
+        target: /etc/nginx/html/index.html
     logging: *logging
 
 volumes:
   # RAM ディスク。既定値だと 68 セグメント × 数百KB 程度しか載りません。
-  # tmpfs が使えない環境なら driver_opts を丸ごと削れば通常ボリュームで動きます。
+  # 全ての配信キーで共有するので、複数の部屋を同時にライブにする場合は
+  # 部屋数ぶん消費が増えます。足りなくなったら driver_opts の size を
+  # 上げてください。tmpfs が使えない環境なら driver_opts を丸ごと削れば
+  # 通常ボリュームで動きます。
   hls:
     driver_opts:
       type: tmpfs
