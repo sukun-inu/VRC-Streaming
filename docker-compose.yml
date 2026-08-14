@@ -742,6 +742,7 @@ configs:
       import json
       import os
       import re
+      import secrets
       import socket
       import sys
       import threading
@@ -1003,7 +1004,7 @@ configs:
         </div>
       </header>
       <main id="streams"></main>
-      <script>
+      <script nonce="__CSP_NONCE__">
       (function () {
         "use strict";
 
@@ -1129,10 +1130,20 @@ configs:
               """(status, content_type, body_bytes, extra_headers) を返すだけで、
               実際に書き出すのは呼び出し側 (do_GET / do_HEAD)。"""
               if self.path == "/" or self.path == "/index.html":
-                  return (
-                      200, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"),
-                      {"Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'"}
-                  )
+                  # CSP の script-src はデフォルト (default-src 'self') のままだと
+                  # 'unsafe-inline' が無いのでインライン <script> がブラウザ側で
+                  # 実行そのものをブロックされる (HTMLは表示されるのにJSだけ動かない、
+                  # という気付きにくい壊れ方をする)。かといって script-src に
+                  # 'unsafe-inline' を足すと、逆引きホスト名などの外部由来の値を
+                  # 将来どこかで誤って innerHTML に混ぜてしまった時の保険が丸ごと
+                  # 消えてしまう。なのでレスポンス毎に使い捨てのnonceを発行し、
+                  # ヘッダーとこの <script> タグの両方に同じ値を入れることで、
+                  # 「このレスポンスが生成した、まさにこのスクリプトタグ」だけを
+                  # 許可する。
+                  nonce = secrets.token_hex(16)
+                  html = DASHBOARD_HTML.replace("__CSP_NONCE__", nonce, 1)
+                  csp = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'nonce-{}'".format(nonce)
+                  return 200, "text/html; charset=utf-8", html.encode("utf-8"), {"Content-Security-Policy": csp}
               if self.path == "/api/state":
                   body = json.dumps(build_state(), ensure_ascii=False).encode("utf-8")
                   return 200, "application/json; charset=utf-8", body, {}
