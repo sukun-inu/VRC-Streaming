@@ -1,150 +1,68 @@
-# VRChat HLS 配信スタック
+# VRChat HLS streaming stack
 
-自宅から VRChat に映像を流すための配信サーバ。PC と Quest の同時視聴前提。
-Portainer の Git スタックとしてそのままデプロイできます。
+A self-hosted streaming server that gets video from your home into VRChat, with PC and
+Quest watching at the same time. Deployable as-is as a Portainer Git stack.
 
-配信キーは固定ではなく「部屋」です。OBS 側で自由に決めたキーごとに
-独立した配信として並走でき、同じキーへの二重配信は拒否されます。
+Stream keys are not fixed — they are *rooms*. Any key you invent in OBS runs as its own
+independent stream, several can run in parallel, and a second publisher on the same key
+is rejected.
 
----
+日本語版: [README.ja.md](README.ja.md)
 
-## 全体像
+## How it fits together
 
-VRChat の動画プレイヤーは URL を1つ渡すとその動画（今回はライブ配信）を再生してくれますが、
-渡せるのは **HLS** という形式の URL だけです。OBS が話す言葉（RTMP）と VRChat が理解できる
-言葉（HLS）は別物なので、間に「翻訳者」が必要です。それがこのサーバの役目です。
+VRChat's video player takes exactly one URL, and it has to be **HLS**. OBS speaks RTMP.
+This server is the translator between the two.
 
 ```
 OBS ─RTMP:1935→ mediamtx(+ffmpeg) ─HLS→ tmpfs ←─ nginx:80
                                                      ↑
-                                 既存の cloudflared ─┘
+                                 existing cloudflared ┘
 ```
 
-cloudflared（自宅の外からアクセスできるようにするトンネル）は既存のものをそのまま使う
-前提で、このリポジトリには含みません。**このリポジトリが管理しているのは `mediamtx` と
-`nginx` の2コンテナだけ**です。
+`cloudflared` is assumed to already exist and is **not** part of this repository. What
+this repo manages is the two containers, `mediamtx` and `nginx`, and nothing else.
 
-各コンポーネントが何をしているかの詳細は [docs/DESIGN.md](docs/DESIGN.md) を参照してください。
+`mediamtx` receives RTMP and tracks which keys are currently publishing. The moment a
+key goes live it starts one `ffmpeg` dedicated to that key, which slices the stream into
+HLS segments on a shared tmpfs; `nginx` serves that directory over HTTP. Segments are
+cached hard, playlists are never cached.
 
----
+A full walkthrough, and the reasoning behind each choice, is in
+[docs/DESIGN.ja.md](docs/DESIGN.ja.md).
 
-## 1. 動かす
+## Running it
 
-**先に旧スタックを落としてください。** `network_mode: host` なので、
-旧構成の MediaMTX が `:80` と `:1935` を掴んだままだと起動に失敗します。
+**Stop the old stack first.** `network_mode: host` means startup fails if anything else
+is holding `:80` or `:1935`.
 
-Portainer → Stacks → Add stack
+Deploy `docker-compose.yml` as a Portainer Git stack. Configuration is by environment
+variable (`MODE`, `SEG_SECONDS`, `SEG_KEEP_EXTRA` and friends).
+
+In OBS, use CBR at 3500-6000 kbps with a 1-second keyframe interval, and pick any stream
+key you like (6-32 characters, alphanumeric plus hyphen and underscore). Codec settings
+are validated automatically.
+
+In VRChat, paste `https://<your-host>/<stream-key>/index.m3u8` into the world's video
+URL field. The same URL works on PC and on Quest.
+
+Step-by-step instructions are in [README.ja.md](README.ja.md) (Japanese).
+
+## Latency
+
+Roughly 4-5 seconds end to end. That is inherent to HLS, which works by writing whole
+segment files and advertising them in a playlist — the reasoning, and why WebRTC is not
+an option here, is in [docs/DESIGN.ja.md](docs/DESIGN.ja.md) and
+[docs/DEAD-ENDS.ja.md](docs/DEAD-ENDS.ja.md).
+
+## Documentation
 
 | | |
 |---|---|
-| Repository URL | このリポジトリ |
-| Compose path | `docker-compose.yml` |
-| Environment variables | 不要（全て既定値あり） |
+| [docs/DESIGN.ja.md](docs/DESIGN.ja.md) | How each component works, why mediamtx and nginx are the only two containers, why latency and stability are separate axes, glossary |
+| [docs/OPERATIONS.ja.md](docs/OPERATIONS.ja.md) | Health checks, and what to look at first when it breaks |
+| [docs/CONFIGURATION.ja.md](docs/CONFIGURATION.ja.md) | Tunables, editing pitfalls, file layout |
+| [docs/DEAD-ENDS.ja.md](docs/DEAD-ENDS.ja.md) | Options that were investigated and rejected, with reasons |
+| [CHANGELOG.md](CHANGELOG.md) | Changes to `docker-compose.yml`, with the "why" |
 
-**`docker-compose.yml` 1 枚で完結します。** Repository でも Web エディタへの
-貼り付けでも同じように動きます。ビルドもホスト側ファイルへの依存もありません。
-
-唯一の前提は Compose のバージョンです。
-
-```bash
-docker compose version
-```
-
-`v2.23.1` 以上であること。`configs` の `content`（設定のインライン埋め込み）に
-これが要ります。
-
-> **なぜ 1 枚に閉じたのか**
-> 外部ファイルを参照した構成では、デプロイが 2 回続けて別々の理由で失敗しました。
-> 1つはビルド (`failed to list workers ... frame too large`)、
-> もう1つはマウント (`not a directory: Are you trying to mount a directory
-> onto a file`)。どちらも「Portainer がリポジトリをどこに展開したか」に
-> 依存する問題です。参照するファイルが無ければ、この種の失敗は起きません。
-
-既存トンネルの Service が `http://localhost:80` を向いている想定です。
-違うポートなら `configs.nginx_conf` の中の `listen` を合わせてください。
-**cloudflared 側の設定変更は不要です。**
-
-## 2. OBS を設定する
-
-`MODE=copy`（既定）は OBS の出力を再エンコードせずそのまま流します。
-CPU をまったく使わず遅延も最小ですが、そのぶん**OBS の設定がそのまま結果になります**。
-
-| 項目 | 値 |
-|---|---|
-| サーバー | `rtmp://<ホストIP>:1935/` |
-| ストリームキー | 自分で決める（下記参照） |
-| 出力解像度 | 1280x720（1920x1080 まで可） |
-| FPS | 30（Quest 同時視聴なら 60 は避ける） |
-| レート制御 | CBR / 3500〜6000 kbps |
-| **キーフレーム間隔** | **1 秒** |
-| プロファイル | main または high |
-| **B フレーム** | **0** |
-| カラーフォーマット | NV12（10bit 不可） |
-| 音声 | AAC 128kbps / 48kHz / ステレオ |
-
-**キーフレーム間隔だけは厳密に。** ここが `SEG_SECONDS` とずれると、
-ffmpeg は指定どおりに切れず OBS 側の間隔で切ります。2 秒なら遅延が倍になります。
-間違えていればログが教えてくれるので、暗記する必要はありません。
-
-### 配信キーについて
-
-ストリームキーは固定値ではありません。**OBS の「ストリームキー」欄に
-自分で決めた文字列を入れてください。** 条件は以下だけです。
-
-| 項目 | 条件 |
-|---|---|
-| 文字種 | 半角英数字・ハイフン(`-`)・アンダースコア(`_`) のみ |
-| 長さ | 6〜32 文字 |
-
-これに一致しないキーは MediaMTX がそもそも受け付けません（[仕組みを詳しく](#仕組みを詳しくなぜこの設計か)で理由を説明）。
-
-キーはそのまま「部屋」の識別子になります。**同じキーへの二重配信は
-拒否されます**（誰かが先に使っているキーには割り込めません）。逆に
-言えば、違うキーを使えば複数の配信を同時にライブにできます。
-
-- 視聴者にキーを伝えれば、その人だけが該当の配信を見られます
-  （URL を知らない/推測できない人には見えません）。
-- **推測されにくいキーにしてください。** `test1234` のような短く
-  ありがちな文字列は避け、ランダムな文字列を推奨します。
-- **RTMP ポート(1935)は自宅LANの外に公開しないでください。** キーは
-  URL 相当の秘匿情報ですが、認証ではないので、ポート自体を外部に
-  晒すと総当たりされます。VRChat 視聴用に外部公開が必要なのは
-  nginx の HTTP(S) 側（cloudflared 経由）だけです。
-- 自分の OBS が瞬断して再接続する場合、`readTimeout`（既定 10 秒）が
-  経過して旧セッションが「死んだ」と判定されるまで再接続できません。
-  二重配信を拒否する設計とのトレードオフです。
-- **リソースはキーの本数ぶん増えます。** 同時にライブなキーが2本なら
-  ffmpeg も2プロセス、tmpfs の消費も2倍、`MODE=transcode` ならCPUも
-  2倍です。tmpfs のサイズは `docker-compose.yml` の `volumes.hls` で
-  調整できます。
-
-## 3. VRChat の URL
-
-```
-https://<トンネルのホスト名>/<配信キー>/index.m3u8
-```
-
-`index.m3u8` を省いた短縮URL (`/<配信キー>` だけ) も一度試しましたが
-**廃止しました。** PC (Windows Media Foundation) では動きましたが、
-Quest 側のプレイヤーは拡張子なしのURLをHLSとして認識できず再生できま
-せんでした。プラットフォームによって動く/動かないが静かに分かれるURL
-は罠でしかないので、全プラットフォームで確実に動くこの形に統一して
-います（[変更履歴](#変更履歴)参照）。
-
-`https://<トンネルのホスト名>/` にアクセスすると、キーを入力して
-このURLを組み立ててコピーできる案内ページが出ます。
-
-master playlist は作っていません。単一レンディションなので不要ですし、
-バリアント選択まわりのトラブルを丸ごと排除できます。
-
----
-
-## ドキュメント
-
-| | |
-|---|---|
-| [docs/DESIGN.md](docs/DESIGN.md) | 各コンポーネントの役割、なぜ mediamtx と nginx の2つだけなのか、遅延と安定性を分離した理由、HLS の遅延が消えない理由、用語集 |
-| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 動いているかの確認手順、直らないときに何から見るか |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 触れる設定の一覧、変更時の落とし穴、構成ファイルの中身 |
-| [docs/DEAD-ENDS.md](docs/DEAD-ENDS.md) | 検討して採用しなかった選択肢とその理由 |
-| [CHANGELOG.md](CHANGELOG.md) | `docker-compose.yml` の変更履歴（「なぜ」つき） |
+Detailed documentation is Japanese-only for now.

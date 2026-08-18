@@ -2,7 +2,7 @@
 
 採用しなかった選択肢と、その理由。同じ道を二度調べないための記録。
 
-[← README に戻る](../README.md)
+[← README.ja.md に戻る](../README.ja.md)
 
 ---
 
